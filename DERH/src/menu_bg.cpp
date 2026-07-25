@@ -18,6 +18,8 @@
 
 #include "menu_bg.h"
 #include "ox_assets.h"
+#include "ox_assets2.h"
+#include "ox_assets3.h"
 #include "ox_preview_dummy.h"
 
 // Возвращает ImTextureID фоновой картинки (0 если не удалось). Размер — в out.
@@ -89,6 +91,13 @@ ImTextureID g_iconTexMarker   = (ImTextureID)0;  // map pin / marker
 ImTextureID g_texBrandMark    = (ImTextureID)0;  // 240x240 eclipsed-ring monogram
 ImTextureID g_texGrain        = (ImTextureID)0;  // 128x128 film grain, GL_REPEAT
 // ESP live-preview dummy character (anime model shown inside the preview pane).
+// Фон меню (присланный арт) и фигура для ESP-превью.
+ImTextureID g_texMenuArt     = (ImTextureID)0;
+int         g_texMenuArtW    = 0;
+int         g_texMenuArtH    = 0;
+ImTextureID g_texPreviewFig  = (ImTextureID)0;
+int         g_texPreviewFigW = 0;
+int         g_texPreviewFigH = 0;
 ImTextureID g_texPreviewDummy   = (ImTextureID)0;
 int         g_texPreviewDummyW  = 0;
 int         g_texPreviewDummyH  = 0;
@@ -151,6 +160,64 @@ void oxLoadIcons() {
     g_iconTexHealth     = g_iconTexHeart;    // health bar   -> heart
     g_iconTexDistance   = g_iconTexRuler;    // distance     -> ruler
     g_iconTexBrandBadge = g_texBrandMark;    // brand badge  -> eclipsed-ring mark
+
+    // ── Новый набор глифов (ox_assets2.h) ──────────────────────────────────
+    // Перекрывают старые хендлы: везде, где меню рисует иконку, теперь
+    // подтягивается процедурно сгенерированный глиф со встроенным свечением.
+    {
+        ImTextureID t;
+        t = ox_uploadIconTexture(brand_mark2_png,  brand_mark2_png_size);  if (t) { g_texBrandMark = t; g_iconTexBrandBadge = t; }
+        t = ox_uploadIconTexture(icon_eye2_png,    icon_eye2_png_size);    if (t) { g_iconTexEye = t; g_iconTexESP = t; }
+        t = ox_uploadIconTexture(icon_target2_png, icon_target2_png_size); if (t) { g_iconTexTarget = t; g_iconTexAim = t; }
+        t = ox_uploadIconTexture(icon_gear2_png,   icon_gear2_png_size);   if (t) g_iconTexGear = t;
+        t = ox_uploadIconTexture(icon_palette2_png,icon_palette2_png_size);if (t) g_iconTexPalette = t;
+        t = ox_uploadIconTexture(icon_radar2_png,  icon_radar2_png_size);  if (t) { g_iconTexMarker = t; g_iconTexLens = t; g_iconTexHud = t; }
+        t = ox_uploadIconTexture(icon_cube2_png,   icon_cube2_png_size);   if (t) g_iconTexCube = t;
+        t = ox_uploadIconTexture(icon_heart2_png,  icon_heart2_png_size);  if (t) { g_iconTexHeart = t; g_iconTexHealth = t; }
+        t = ox_uploadIconTexture(icon_ruler2_png,  icon_ruler2_png_size);  if (t) { g_iconTexRuler = t; g_iconTexDistance = t; }
+        t = ox_uploadIconTexture(icon_bolt2_png,   icon_bolt2_png_size);   if (t) g_iconTexBolt = t;
+        t = ox_uploadIconTexture(icon_shield2_png, icon_shield2_png_size); if (t) g_iconTexShield = t;
+    }
+
+    // ── Фон меню и фигура превью (ox_assets3.h) ────────────────────────────
+    {
+        int w = 0, h = 0, n = 0;
+        unsigned char* px = stbi_load_from_memory(menu_art_jpg, (int)menu_art_jpg_size,
+                                                  &w, &h, &n, 4);
+        if (px) {
+            GLuint id = 0;
+            glGenTextures(1, &id);
+            glBindTexture(GL_TEXTURE_2D, id);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            stbi_image_free(px);
+            g_texMenuArt  = (ImTextureID)(uintptr_t)id;
+            g_texMenuArtW = w; g_texMenuArtH = h;
+        }
+    }
+    {
+        int w = 0, h = 0, n = 0;
+        unsigned char* px = stbi_load_from_memory(preview_figure_png,
+                                                  (int)preview_figure_png_size, &w, &h, &n, 4);
+        if (px) {
+            GLuint id = 0;
+            glGenTextures(1, &id);
+            glBindTexture(GL_TEXTURE_2D, id);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            stbi_image_free(px);
+            g_texPreviewFig  = (ImTextureID)(uintptr_t)id;
+            g_texPreviewFigW = w; g_texPreviewFigH = h;
+        }
+    }
 
     // ESP-preview dummy: нужен размер, чтобы держать aspect-ratio в панели.
     {

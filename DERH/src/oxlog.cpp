@@ -31,7 +31,14 @@ namespace oxlog {
 bool verbose = false;
 // Startup failures happen before the menu can expose logging controls.
 // Keep diagnostics enabled so users receive a reason instead of a blank log.
+// Выключено в релизе: даже при вырезанных макросах init() иначе создавал бы
+// файл на /sdcard/Download — лишний артефакт на устройстве и лишний след.
+// Включается сборкой с -DOX_ENABLE_LOG.
+#ifdef OX_ENABLE_LOG
 bool enabled = true;
+#else
+bool enabled = false;
+#endif
 int  frameCounter = 0;
 
 static FILE*      g_file = nullptr;
@@ -88,6 +95,9 @@ static void timestamp(char* out, size_t n) {
 
 const char* init() {
     if (g_file) return g_path;
+    // Без -DOX_ENABLE_LOG файл не создаётся вообще: ни записи на sdcard, ни
+    // самого артефакта в Download.
+    if (!enabled) return "";
 
     // Имя файла с датой-временем старта.
     time_t t = time(nullptr);

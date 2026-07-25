@@ -138,6 +138,9 @@ static bool g_typeInfoAutoResolved = false;
 // TypeInfo RVA (который на metadata v39 нестабилен) больше не нужен.
 static uint64_t g_playerManagerKlass = 0;
 static uint64_t g_buildingPieceKlass = 0;
+// Mirror.NetworkClient (TDI 23916) — статический класс с реестром spawned.
+// Нужен как резервный источник построек для LOS: saveList у клиента пустой.
+static uint64_t g_networkClientKlass = 0;
 
 // структура для кэширования данных игрока
 struct PlayerCacheData {
@@ -543,12 +546,20 @@ float aimCrouchDrop = 0.45f;   // на сколько метров опусти�
 // LOS-чек (аим через стены): если ON — аимбот не наводится на цель, перекрытую
 // building piece'ом по ходу луча. ESP при этом рисует цель СИНИМ (невидим) и
 // ЗЕЛЁНЫМ (видим) — отдельно от команды/инга.
-bool aimCheckWalls = true;
-bool aimIgnoreTeammates = true;   // Аим пропускает сокомандников (team-key == local's team)
-bool espColorByVisibility = true; // true — видимый=зелёный, за стеной=синий
+bool aimCheckWalls = false;  // снят из меню: см. espColorByVisibility
+bool aimIgnoreTeammates = false;  // см. espHideTeammates — источник команды пуст
+// Валл-чек убран из меню: BuildingPiece.saveList наполняется только на СЕРВЕРЕ
+// (OnStartServer), у клиента он пустой by design. Резерв через
+// NetworkClient.spawned находит единицы объектов (matched=1..2 из ~50) —
+// этого мало для честной проверки стен, поэтому окраска по видимости
+// выключена, а не показывает ложную картину.
+bool espColorByVisibility = false;
 // --- Новый пакет фич (всё на чтении) ---
 // Unity Matrix4x4 в памяти лежит column-major: m00 m10 m20 m30 m01 m11 ...
 struct OxMat4 { float m[16]; };
+// Сила подсветки стекла. Управляет ореолом вокруг панели, цветной дымкой
+// внутри неё и яркостью кромок разом — один ползунок на весь материал.
+float glowIntensity = 1.0f;
 bool espModelAnchor = true; // ESP по трансформам модели вместо серверного тика
 // Матричный W2S: берём worldToCameraMatrix/projectionMatrix прямо из нативной
 // камеры вместо реконструкции базиса из углов. Смещения ищутся по подписи один
@@ -709,12 +720,15 @@ int   g_accentTheme = 1;     // индекс акцент-темы GLASS UI (0..
 int   g_enemyCount  = 0;     // сколько игроков сейчас в кэше (для счётчика)
 int   g_cacheInterval = 10;  // heavy list/HP scan; positions are refreshed separately
 int   g_positionInterval = 1;  // рефреш позиций каждый кадр — минимальный drift ESP
-bool  espHideTeammates = true;
+// Скрытие тимейтов снято из меню: ни один из трёх источников состава команды
+// не заполнен в этом билде (nWc.team=0, TeammateStates пуст, UI-панель тоже).
+// Оставлено выключенным, чтобы не тратить чтения на заведомо пустые цепочки.
+bool  espHideTeammates = false;
 bool espname;
 bool esphealth;
 bool vischeck;
 bool esphat;
-bool skeleton = false;   // ESP-скелет (реальные кости модели)
+bool skeleton = false;   // снят из меню: кость головы не отдаёт трансформ   // ESP-скелет (реальные кости модели)
 bool outoffov;
 bool oofvis;
 bool ESP3D;
@@ -1381,6 +1395,7 @@ static uint64_t ox_findKlassInHeap(uint64_t nameVa, uint64_t regionStart, size_t
 // Все шесть metadata-глобалов сдвинулись ровно на -0x1FC00.
 // Мнемоника снова сходится: ctx(0xBF613F8) + 0x48 = 0xBF61440.
 static constexpr uint64_t OX_S_TYPEINFO_TABLE_RVA = 0xBF61440ULL;  // was 0xBF81040
+static constexpr uint32_t OX_TDI_NETWORKCLIENT    = 23916;  // Mirror.NetworkClient
 static constexpr uint32_t OX_TDI_PLAYERMANAGER    = 8357;  // was 8251
 static constexpr uint32_t OX_TDI_BUILDINGPIECE    = 8633;  // was 8521
 static constexpr uint32_t OX_TDI_PLAYERVITALS     = 8030;  // was 7923
@@ -1520,6 +1535,27 @@ static bool ox_fastSeedTypeInfoFromHeader() {
             }
             if (!done)
                 OXLOGW("[self-heal] %s: не найден ни в одном слоте таблицы", s.expected);
+        }
+    }
+
+    // Mirror.NetworkClient по TDI из того же s_TypeInfoDefinitionTable.
+    // Не входит в обязательный набор: если не поднялся, LOS просто останется
+    // без резервного источника, остальное работает.
+    if (!g_networkClientKlass) {
+        uint64_t table = rpm<uint64_t>(il2cpp_base + OX_S_TYPEINFO_TABLE_RVA);
+        if (ox_isPtr(table)) {
+            uint64_t k = rpm<uint64_t>(table + (uint64_t)OX_TDI_NETWORKCLIENT * 8);
+            if (ox_isPtr(k)) {
+                uint64_t np = rpm<uint64_t>(k + ox::CLASS_NAME);
+                if (ox_asciiEquals(np, "NetworkClient")) {
+                    g_networkClientKlass = k;
+                    OXLOGI("[seed] NetworkClient klass=0x%llx (TDI %u)",
+                           (unsigned long long)k, OX_TDI_NETWORKCLIENT);
+                } else {
+                    OXLOGW("[seed] NetworkClient: имя на TDI %u не совпало",
+                           OX_TDI_NETWORKCLIENT);
+                }
+            }
         }
     }
 
@@ -2024,7 +2060,7 @@ static int ox_forEachDictStringKeys(uint64_t dictObj, CB&& cb) {
 
 // Разовая диагностика цепочки команды (раз в 3 сек), чтобы видеть где рвётся:
 // PM.team(0x120) -> nWc.team(0x90) -> Cc.dCI(0x20) -> List<TeamMember>.
-static void ox_logTeamChain(uint64_t localPm, uint64_t targetPm) {
+[[maybe_unused]] static void ox_logTeamChain(uint64_t localPm, uint64_t targetPm) {
     static double s_last = 0.0;
     double now = (double)ImGui::GetTime();
     if (now - s_last < 3.0) return;
@@ -2064,7 +2100,9 @@ static void ox_logTeamChain(uint64_t localPm, uint64_t targetPm) {
 
 static bool ox_isTeammate(uint64_t localPm, uint64_t targetPm) {
     if (!ox_isPtr(localPm) || !ox_isPtr(targetPm) || localPm == targetPm) return false;
+#ifdef OX_ENABLE_LOG
     if (espHideTeammates || aimIgnoreTeammates) ox_logTeamChain(localPm, targetPm);
+#endif
 
     // ── ГЛАВНЫЙ ПУТЬ: nWc.TeammateStates ───────────────────────────────────
     // В этом билде nWc.team(0x90) приходит нулём даже когда игрок в команде,
@@ -2105,6 +2143,37 @@ static bool ox_isTeammate(uint64_t localPm, uint64_t targetPm) {
         if (ox_isPtr(lcc) && lcc == tcc) return true;
         // И берём его как источник ростера, если основной пуст.
         if (!ox_isPtr(lpf) && ox_isPtr(lcc)) lpf = lcc;
+    }
+
+    // ── ТРЕТИЙ ПУТЬ: UI-панель команды ─────────────────────────────────────
+    // RaycastManager.teamManager(0x28) -> CW.membersList(0x90) -> List<nWR>,
+    // где nWR.identificator(0x38) — UI.Text с userID участника. Этот список
+    // живёт в UI-слое и заполнен, даже когда и nWc.team, и TeammateStates
+    // пустые: панель команды рисуется из собственных данных.
+    {
+        uint64_t rm = rpm<uint64_t>(localPm + ox::PM_RAYCASTMANAGER);
+        uint64_t cw = ox_isPtr(rm) ? rpm<uint64_t>(rm + ox::RM_TEAM_MANAGER) : 0;
+        if (ox_isPtr(cw)) {
+            uint64_t list = rpm<uint64_t>(cw + ox::CW_MEMBERS_LIST);
+            if (ox_isPtr(list)) {
+                uint64_t items = rpm<uint64_t>(list + ox::LIST_ITEMS);
+                int      size  = rpm<int>(list + ox::LIST_SIZE);
+                if (ox_isPtr(items) && size > 0 && size <= 16) {
+                    std::string tid = ox_readStringKey(rpm<uint64_t>(targetPm + ox::PM_USER_ID));
+                    if (!tid.empty()) {
+                        uint64_t elems = items + ox::ARRAY_DATA;
+                        for (int i = 0; i < size; ++i) {
+                            uint64_t row = rpm<uint64_t>(elems + i * 8);
+                            if (!ox_isPtr(row)) continue;
+                            uint64_t txt = rpm<uint64_t>(row + ox::NWR_IDENTIFICATOR);
+                            if (!ox_isPtr(txt)) continue;
+                            std::string id = ox_readStringKey(rpm<uint64_t>(txt + ox::UITEXT_M_TEXT));
+                            if (!id.empty() && id == tid) return true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (!ox_isPtr(lpf)) return false;   // мы не в команде — скрывать некого
@@ -2624,7 +2693,25 @@ static bool ox_readSkeleton(uint64_t player, const Vector3 &feet, PlayerCacheDat
     bool haveHead = false, haveBody = false, haveRH = false, haveLH = false;
 
     // 1) KCC.head — самый надёжный и дешёвый источник головы.
-    uint64_t kcc = rpm<uint64_t>(player + 0xB0);
+    // PM+0xB0 это InterfaceReference<sA>, ОБЁРТКА, а не сам KCC. Раньше здесь
+    // читалось напрямую — поэтому вся цепочка (голова, руки, корпус) молча
+    // рвалась и скелет не рисовался ВООБЩЕ. Якоря я вчера починил, а этот
+    // путь пропустил: он свой, отдельный.
+    // Ищем настоящий KCC самопроверкой: у него поле player(0x78) указывает
+    // ОБРАТНО на наш PM — случайным такое совпадение быть не может.
+    uint64_t kccRaw = rpm<uint64_t>(player + ox::PM_KCC_REFERENCE);
+    uint64_t kcc = 0;
+    if (ox_isPtr(kccRaw)) {
+        if (rpm<uint64_t>(kccRaw + ox::KCC_PLAYER) == player) {
+            kcc = kccRaw;
+        } else {
+            for (int w = 0x00; w <= 0x30 && !kcc; w += 8) {
+                uint64_t cand = rpm<uint64_t>(kccRaw + w);
+                if (ox_isPtr(cand) &&
+                    rpm<uint64_t>(cand + ox::KCC_PLAYER) == player) kcc = cand;
+            }
+        }
+    }
     if (ox_isPtr(kcc)) {
         uint64_t headTr = rpm<uint64_t>(kcc + ox::KCC_HEAD);
         if (ox_isPtr(headTr))
@@ -3065,11 +3152,23 @@ static CameraView ox_getCamera(uint64_t elems, int count, bool full) {
 
     // Кандидаты: все PM с валидной связкой камеры. Их может быть НЕСКОЛЬКО —
     // после респавна старый труп какое-то время лежит в списке рядом с новым.
-    uint64_t cands[8]; int nc = 0;
-    for (int i = 0; i < count && nc < 8; i++) {
+    // Сначала ищем владельца по флагу ПО ВСЕМУ списку, а не по первым восьми:
+    // потолок массива отсекал часть игроков, и если наш PM оказывался девятым,
+    // его просто не рассматривали.
+    uint64_t cands[16]; int nc = 0;
+    uint64_t flagged = 0;
+    for (int i = 0; i < count; i++) {
         uint64_t p = rpm<uint64_t>(elems + i * 8);
-        if (ox_isPtr(p) && ox_localPlayerAlive(p)) cands[nc++] = p;
+        if (!ox_isPtr(p)) continue;
+        if (!flagged) {
+            uint64_t ni = rpm<uint64_t>(p + ox::NB_NET_IDENTITY);
+            if (ox_isPtr(ni) && rpm<uint8_t>(ni + ox::NI_IS_LOCAL_PLAYER) != 0)
+                flagged = p;
+        }
+        if (nc < 16 && ox_localPlayerAlive(p)) cands[nc++] = p;
     }
+    // Флаг найден — он и есть ответ, остальные кандидаты не нужны.
+    if (flagged) { cands[0] = flagged; nc = 1; }
 
     bool inList = false;
     for (int i = 0; i < nc; i++) if (cands[i] == g_localPlayer) { inList = true; break; }
@@ -3099,7 +3198,42 @@ static CameraView ox_getCamera(uint64_t elems, int count, bool full) {
         ox_lookWatchReset();
     }
 
-    // ── Выбор владельца камеры ──────────────────────────────────────────────
+    // ── ГЛАВНЫЙ КРИТЕРИЙ: Mirror.NetworkIdentity.isLocalPlayer ─────────────
+    // Mirror выставляет этот флаг РОВНО ОДНОМУ объекту за матч — тому, которым
+    // управляет данный клиент. Это прямой ответ на вопрос «кто я», а не
+    // догадка по косвенным признакам.
+    //
+    // Все прежние критерии были эвристиками и промахивались:
+    //   * наличие MouseLook+RaycastManager — есть у КАЖДОГО игрока
+    //   * замороженные углы — живой игрок, не трогающий экран, неотличим от трупа
+    //   * Transform над ногами — верно для всех живых, не только для нас
+    // Если выбирался чужой PM, базис камеры строился из ЧУЖИХ углов: свою
+    // камеру поворачиваешь, а боксы считаются от чужой — ESP «плавает».
+    {
+        int owner = -1;
+        for (int ci = 0; ci < nc; ci++) {
+            uint64_t ni = rpm<uint64_t>(cands[ci] + ox::NB_NET_IDENTITY);
+            if (!ox_isPtr(ni)) continue;
+            if (rpm<uint8_t>(ni + ox::NI_IS_LOCAL_PLAYER) != 0) { owner = ci; break; }
+        }
+        if (owner >= 0) {
+            if (cands[owner] != g_localPlayer)
+                OXLOGI("[local] найден по NetworkIdentity.isLocalPlayer: PM=0x%llx (был 0x%llx)",
+                       (unsigned long long)cands[owner],
+                       (unsigned long long)g_localPlayer);
+            cands[0] = cands[owner]; nc = 1;
+        } else {
+            static double s_lastNoOwner = 0.0;
+            double nw2 = (double)ImGui::GetTime();
+            if (nw2 - s_lastNoOwner > 5.0) {
+                s_lastNoOwner = nw2;
+                OXLOGW("[local] isLocalPlayer не найден ни у одного из %d кандидатов "
+                       "— падаю на геометрический тест", nc);
+            }
+        }
+    }
+
+    // ── Запасной выбор: геометрия (когда флаг не прочитался) ───────────────
     // Детект по «замороженным углам» ненадёжен: труп может простоять неподвижно
     // ровно столько же, сколько живой игрок, который не трогает экран. Поэтому
     // основной критерий другой и мгновенный: у ЖИВОГО локального игрока
@@ -3480,6 +3614,79 @@ static void ox_updateBuildingCache(bool full) {
                    "если count<=0 — клиент не получает постройки от сервера.");
         }
     }
+    // ── РЕЗЕРВ: NetworkClient.spawned ──────────────────────────────────────
+    // BuildingPiece попадает в saveList только на СЕРВЕРЕ (OnStartServer), у
+    // клиента этот список пустой — в логах стабильно count=0, поэтому LOS не
+    // работал вообще. А spawned заполнен всегда: это реестр всех сетевых
+    // объектов, которые знает клиент.
+    // Обход: spawned -> NetworkIdentity -> NetworkBehaviours[] -> ищем среди
+    // компонентов BuildingPiece. Опознаём его по САМОСОГЛАСОВАННОСТИ полей:
+    // health/maxHealth в разумном диапазоне и m_Bounds с ненулевыми extents.
+    // Так не нужно знать индекс компонента и класс заранее.
+    if (newCache.empty() && g_networkClientKlass) {
+        uint64_t ncStatics = rpm<uint64_t>(g_networkClientKlass + ox::CLASS_STATIC_FIELDS);
+        uint64_t spawned = ox_isPtr(ncStatics)
+                         ? rpm<uint64_t>(ncStatics + ox::NC_SPAWNED_DICT) : 0;
+        int walked = 0, matched = 0;
+        // Собственный обход, а НЕ ox_forEachDictValues: тот режет словари
+        // больше LOS_SAVELIST_MAX (2000), а spawned на большой карте заведомо
+        // крупнее и весь резерв молча вернул бы -1.
+        auto walkSpawned = [&](uint64_t dictObj, auto&& cb) {
+            if (!ox_isPtr(dictObj)) return;
+            uint64_t entries = rpm<uint64_t>(dictObj + ox::DICT_ENTRIES);
+            if (!ox_isPtr(entries)) return;
+            int count = rpm<int>(dictObj + ox::DICT_COUNT);
+            if (count <= 0) return;
+            uint64_t arrLen = rpm<uint64_t>(entries + ox::ARRAY_COUNT);
+            if (arrLen == 0) return;
+            if ((uint64_t)count > arrLen) count = (int)arrLen;
+            if (count > ox::SPAWNED_SCAN_MAX) count = ox::SPAWNED_SCAN_MAX;
+
+            // Одним vm_readv на весь блок — это ~96 КБ, дёшево. Дорогая часть
+            // ниже (чтение компонентов), поэтому она под потолком и идёт раз
+            // в BUILDING_CACHE_INTERVAL кадров.
+            size_t bytes = (size_t)count * (size_t)ox::DICT_ENTRY_STRIDE;
+            std::vector<uint8_t> buf(bytes);
+            if (!vm_readv(entries + ox::ARRAY_DATA, buf.data(), bytes)) return;
+            for (int i = 0; i < count; ++i) {
+                const uint8_t* e = buf.data() + (size_t)i * ox::DICT_ENTRY_STRIDE;
+                int32_t hc; memcpy(&hc, e + ox::DICT_ENTRY_HASHCODE, 4);
+                if (hc < 0) continue;
+                uint64_t v; memcpy(&v, e + ox::DICT_ENTRY_VALUE, 8);
+                if (ox_isPtr(v)) cb(v);
+            }
+        };
+        if (ox_isPtr(spawned)) {
+            walkSpawned(spawned, [&](uint64_t ni) {
+                if (walked++ > ox::SPAWNED_SCAN_MAX) return;
+                uint64_t arr = rpm<uint64_t>(ni + ox::NI_BEHAVIOURS);
+                if (!ox_isPtr(arr)) return;
+                uint64_t n = rpm<uint64_t>(arr + ox::ARRAY_COUNT);
+                if (n == 0 || n > 16) return;
+                uint64_t base = arr + ox::ARRAY_DATA;
+                for (uint64_t k = 0; k < n; ++k) {
+                    uint64_t comp = rpm<uint64_t>(base + k * 8);
+                    if (!ox_isPtr(comp)) continue;
+                    // Самопроверка «это BuildingPiece»: здоровье осмысленное.
+                    float hp  = rpm<float>(comp + ox::BP_HEALTH);
+                    float mhp = rpm<float>(comp + ox::BP_MAXHEALTH);
+                    if (!isfinite(hp) || !isfinite(mhp)) continue;
+                    if (hp <= 0.f || mhp <= 0.f || hp > mhp * 1.05f || mhp > 100000.f) continue;
+                    BuildingCacheEntry e{};
+                    e.address = comp;
+                    if (!ox_readWorldAABB(comp, e.bounds)) continue;
+                    e.valid = true;
+                    newCache.push_back(e);
+                    matched++;
+                    break;   // один BuildingPiece на объект
+                }
+            });
+        }
+        if (full || matched > 0)
+            OXLOGI("[LOS] fallback NetworkClient.spawned=0x%llx walked=%d matched=%d",
+                   (unsigned long long)spawned, walked, matched);
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_buildingMutex);
         g_buildingCache = std::move(newCache);
@@ -4040,9 +4247,20 @@ void UpdatePlayerCache() {
         Vector3 pos = ox_readPos(player, full && i < 2);
         if (pos == Vector3::Zero()) { skippedPos++; continue; }
 
-        // Себя не рисуем. Сверяем по указателю на локального игрока (найден в ox_getCamera),
-        // т.к. прямого флага isLocalPlayer в этом билде нет.
-        if (player == g_localPlayer) { skippedLocal++; continue; } // все остальные всегда видны
+        // Себя не рисуем. Основной критерий — прямой флаг Mirror:
+        // NetworkBehaviour.netIdentity(0x40).isLocalPlayer(0x4A). Он не зависит
+        // от того, успел ли ox_getCamera выбрать владельца, поэтому свой бокс
+        // не мелькает в первые кадры матча. Сверка по указателю оставлена
+        // вторым условием на случай, если netIdentity ещё не привязан.
+        {
+            bool isSelf = (player == g_localPlayer);
+            if (!isSelf) {
+                uint64_t ni = rpm<uint64_t>(player + ox::NB_NET_IDENTITY);
+                if (ox_isPtr(ni) && rpm<uint8_t>(ni + ox::NI_IS_LOCAL_PLAYER) != 0)
+                    isSelf = true;
+            }
+            if (isSelf) { skippedLocal++; continue; }
+        }
 
         // FIX bug #2: стабильный team-key (raw UTF-16 teamName / pf.teamId / pf-ptr).
         // pf-указатель как fallback — все тимейты имеют один shared pf, разные — разные pf.
@@ -4454,6 +4672,10 @@ int main(int argc, char *argv[]) {
             // Камеру пересчитываем КАЖДЫЙ кадр из живого трансформа локального
             // игрока — боксы мгновенно следуют за поворотом камеры (0 задержки).
             CameraView liveCam; liveCam.valid = false;
+            // Признак смерти нужен и ниже, в блоке чтения матрицы: тот
+            // выполняется ПОСЛЕ этой проверки и иначе тут же вернул бы
+            // g_camVPValid=true, прочитав камеру трупа.
+            bool localDeadThisFrame = false;
             if (g_localPlayer) {
                 liveCam = ox_buildCameraFromPlayer(g_localPlayer, false);
                 // Страховка: если углы выбранного PM застыли дольше 3 секунд —
@@ -4471,6 +4693,7 @@ int main(int argc, char *argv[]) {
                 // всех ровно 100). Текущее HP синкается и отдельным полем в
                 // дампе не значится, так что та ветка была мёртвой.
                 bool localDead = rpm<uint8_t>(g_localPlayer + ox::PM_RESPAWNING) != 0;
+                localDeadThisFrame = localDead;
                 if (localDead) {
                     static double s_lastDeadLog = 0.0;
                     double nd = (double)ImGui::GetTime();
@@ -4479,6 +4702,12 @@ int main(int argc, char *argv[]) {
                         OXLOGI("[respawn] локальный игрок мёртв/респавнится — ESP скрыт, ждём нового PM");
                     }
                     liveCam.valid = false;
+                    // Гасим и матричный путь тоже. Иначе смерть отключает
+                    // только угловую проекцию, а матрица (которая читается из
+                    // камеры трупа и уже не обновляется) продолжает рисовать
+                    // застывшие боксы — тот самый «ESP остаётся при повороте».
+                    g_camVPValid  = false;
+                    g_camPosValid = false;
                     cache_needs_update = true;   // форсируем пере-выбор владельца
                 }
 
@@ -4517,7 +4746,7 @@ int main(int argc, char *argv[]) {
                 // Здесь ловим сам факт подмены: сменился PM или сменился
                 // указатель камеры => немедленно выбрасываем кэш.
                 uint64_t nativeCam = 0;
-                if (espMatrixW2S && g_localPlayer)
+                if (espMatrixW2S && g_localPlayer && !localDeadThisFrame)
                     nativeCam = ox_getNativeCamera(g_localPlayer);
 
                 // Кэш смещений матриц привязан к КАМЕРЕ, а не к игроку.
@@ -4551,22 +4780,62 @@ int main(int argc, char *argv[]) {
                     if (g_camViewMatOff == -1 || nativeCam != g_camNativeCached)
                         ox_findCameraMatrices(nativeCam);
                     got = ox_readViewProjection(nativeCam, &g_camVP);
+
+                    // ── ЗАСТЫВШАЯ МАТРИЦА ─────────────────────────────────
+                    // Камера трупа продолжает отдавать ГЕОМЕТРИЧЕСКИ ВАЛИДНУЮ
+                    // матрицу — просто она больше не обновляется. Проверки
+                    // подписи её пропускают, и мы честно проецируем по мёртвым
+                    // данным: боксы застывают на экране и едут вместе с ним.
+                    //
+                    // Ловим это по самой матрице: если её содержимое не
+                    // изменилось ни на бит дольше секунды, значит движок в неё
+                    // не пишет. Живая камера меняется каждый кадр — даже когда
+                    // стоишь на месте, там дышит FOV и микродрожание.
+                    if (got) {
+                        static OxMat4 s_prevVP{};
+                        static double s_lastVpChange = 0.0;
+                        static bool   s_seeded = false;
+                        double nowV = (double)ImGui::GetTime();
+                        bool same = s_seeded &&
+                                    memcmp(&s_prevVP, &g_camVP, sizeof(OxMat4)) == 0;
+                        if (!same) { s_prevVP = g_camVP; s_lastVpChange = nowV; s_seeded = true; }
+                        if (s_seeded && (nowV - s_lastVpChange) > 1.0) {
+                            static double s_lastFrozenLog = 0.0;
+                            if (nowV - s_lastFrozenLog > 3.0) {
+                                s_lastFrozenLog = nowV;
+                                OXLOGW("[cam] матрица не менялась %.1fс — камера мертва, ESP скрыт",
+                                       nowV - s_lastVpChange);
+                            }
+                            got = false;                 // считаем камеру мёртвой
+                            cache_needs_update = true;   // подтолкнуть пере-выбор PM
+                        }
+                    }
                 }
                 if (got) {
                     s_missStreak = 0;
                     g_camVPValid = true;
-                } else if (g_camVPValid && ++s_missStreak <= 8) {
-                    // Разовый промах валидации (кадр поймали в момент записи
-                    // матрицы движком) — держим прошлую VP вместо мигания
-                    // между матричным и угловым путём. Оно и давало рывки.
+                } else if (g_camVPValid && ++s_missStreak <= 2) {
+                    // Гистерезис ужат с 8 кадров до 2. Восемь кадров — это
+                    // ~130 мс отрисовки по ПРОТУХШЕЙ матрице: за это время
+                    // камера успевает заметно повернуться, и боксы уезжают
+                    // вместе с экраном. Два кадра гасят разовый промах (кадр
+                    // поймали в момент, когда движок пишет матрицу), но не
+                    // дают залипнуть на мёртвой камере.
                 } else {
                     g_camVPValid = false;
                     g_camPosValid = false;
                 }
+                if (localDeadThisFrame) {   // мёртв — ни одного источника
+                    g_camVPValid  = false;
+                    g_camPosValid = false;
+                }
             }
 
-            // Диагностика раз в 2 сек: видно какой путь реально работает и,
-            // если якоря не читаются — на каком именно шаге рвётся цепочка.
+            // Диагностика раз в 2 сек. Обёрнута целиком, а не только вывод:
+            // внутри реальные чтения памяти игры (ox_getNativeCamera, обход
+            // кэша, повторный ox_readModelAnchors) — макрос OXLOG их бы не
+            // убрал, они выполнялись бы впустую каждые две секунды.
+#ifdef OX_ENABLE_LOG
             {
                 static double s_lastDiag = 0.0;
                 double nowD = (double)ImGui::GetTime();
@@ -4580,8 +4849,16 @@ int main(int argc, char *argv[]) {
                     // поиск шёл и не нашёл. Без этого «viewOff=-1» выглядел
                     // одинаково в обоих случаях.
                     uint64_t dbgCam = g_localPlayer ? ox_getNativeCamera(g_localPlayer) : 0;
-                    OXLOGI("[w2s] matrix=%d viewOff=%d projOff=%d | pm=0x%llx nativeCam=0x%llx | anchors=%d/%d",
-                           (int)g_camVPValid, g_camViewMatOff, g_camProjMatOff,
+                    // Подтверждение, что владелец камеры — действительно НАШ
+                    // игрок, а не чужой: читаем флаг прямо у выбранного PM.
+                    int dbgFlag = -1;
+                    if (g_localPlayer) {
+                        uint64_t ni = rpm<uint64_t>(g_localPlayer + ox::NB_NET_IDENTITY);
+                        if (ox_isPtr(ni)) dbgFlag = rpm<uint8_t>(ni + ox::NI_IS_LOCAL_PLAYER) ? 1 : 0;
+                    }
+                    OXLOGI("[w2s] matrix=%d cam=%d dead=%d isLocal=%d | viewOff=%d projOff=%d | pm=0x%llx nativeCam=0x%llx | anchors=%d/%d",
+                           (int)g_camVPValid, (int)liveCam.valid, (int)localDeadThisFrame,
+                           dbgFlag, g_camViewMatOff, g_camProjMatOff,
                            (unsigned long long)g_localPlayer,
                            (unsigned long long)dbgCam,
                            anchored, (int)cached_players.size());
@@ -4608,6 +4885,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
+#endif
 
             int positionInterval = g_positionInterval < 1 ? 1 : g_positionInterval;
             bool refreshPositions = !cacheUpdatedThisFrame &&
@@ -4623,7 +4901,11 @@ int main(int argc, char *argv[]) {
                 bool visB = false, visT = false;
                 ImVec2 w2sBottom, w2sTop;
                 Vector3 livePos = player.position;
-                if (liveCam.valid) {
+                // Рисуем ТОЛЬКО при живом источнике проекции: либо свежая
+                // VP-матрица, либо валидный угловой базис. Иначе — пропуск
+                // (см. ветку ниже): любые старые координаты приклеиваются к
+                // экрану и едут вместе с поворотом камеры.
+                if (liveCam.valid || g_camVPValid) {
                     // Перечитываем позицию игрока КАЖДЫЙ кадр (дёшево: пара чтений
                     // трансформа), чтобы бокс идеально держался на бегущем игроке
                     // без отставания от тяжёлого скана UpdatePlayerCache.
@@ -4649,10 +4931,26 @@ int main(int argc, char *argv[]) {
                                      ? anch.feet
                                      : livePos + Vector3(0.f, ox_boxYOffset(), 0.f);
 
-                    if (skeleton && player.distance < 220.f)
+                    if (skeleton && player.distance < 220.f) {
                         ox_readSkeleton(player.address, skelFeet, player);
-                    else
+#ifdef OX_ENABLE_LOG
+                        // Раз в 3 сек показываем, читается ли скелет вообще —
+                        // иначе «не рисуется» неотличимо от «не включён».
+                        static double s_lastSkelLog = 0.0;
+                        double ns = (double)ImGui::GetTime();
+                        if (ns - s_lastSkelLog > 3.0) {
+                            s_lastSkelLog = ns;
+                            OXLOGI("[skel] pm=0x%llx data=%d head=(%.2f %.2f %.2f) feet=(%.2f %.2f %.2f) d=%.1f",
+                                   (unsigned long long)player.address,
+                                   (int)player.hasSkeletonData,
+                                   player.headPos.x, player.headPos.y, player.headPos.z,
+                                   skelFeet.x, skelFeet.y, skelFeet.z,
+                                   player.distance);
+                        }
+#endif
+                    } else {
                         player.hasSkeletonData = false;
+                    }
 
                     // Проекция: матричная если VP прочиталась, иначе угловая.
                     // Обе ветки дают одинаковые screen-координаты, разница в
@@ -4671,6 +4969,8 @@ int main(int argc, char *argv[]) {
                             *vis = false;
                             return ImVec2(-1.f, -1.f);
                         }
+                        // Угловой путь оставлен только как запасной. Если
+                        // матрица не поднялась, но базис есть — рисуем по нему.
                         return w2s_angular(wp, liveCam, vis);
                     };
 
@@ -4695,8 +4995,17 @@ int main(int argc, char *argv[]) {
                         w2sTop    = project(anchorPos + Vector3(0, ox::BOX_HEAD, 0), &visT);
                     }
                 } else {
-                    w2sBottom = player.w2sBottom; w2sTop = player.w2sTop;
-                    visB = player.isVisibleBottom; visT = player.isVisibleTop;
+                    // КАМЕРЫ НЕТ — НИЧЕГО НЕ РИСУЕМ.
+                    //
+                    // Здесь раньше подставлялись ЭКРАННЫЕ координаты прошлого
+                    // кадра из кэша. Они посчитаны для старого положения
+                    // камеры и статичны: поворачиваешь экран — боксы остаются
+                    // висеть там же и «плавают» вместе с поворотом. Ровно тот
+                    // симптом, что после смерти ESP не уходит за край экрана.
+                    //
+                    // Пустой экран честнее приклеенных боксов: они не просто
+                    // бесполезны, они показывают врагов не там, где те есть.
+                    continue;
                 }
                 if (!visB && !visT) continue;
 
@@ -6170,33 +6479,49 @@ static void oxDrawClickBar(const ImVec2& ds) {
     // Perf: число колец адаптивно (q0=5 как раньше, q1=3, q2=2). Шаг растяжения
     // держим постоянным по внешней кромке (ex зависит от i/count), альфа
     // нормируется на count — суммарная яркость и радиус ауры визуально те же.
-    float auraK = 0.32f + 0.14f * breathe + hovA * 0.30f + press * 0.55f;
-    int auraN; switch (ox_uiQuality()) { case 2: auraN = 2; break; case 1: auraN = 3; break; default: auraN = 5; }
+    // Тот же стеклянный материал, что и у панели меню, только в масштабе
+    // пилюли: ореол -> подложка -> градиент света -> дымка -> кромка.
+    // Клик-бар и меню обязаны читаться как одно изделие.
+    float auraK = (0.30f + 0.13f * breathe + hovA * 0.30f + press * 0.55f) * glowIntensity;
+    int auraN; switch (ox_uiQuality()) { case 2: auraN = 2; break; case 1: auraN = 4; break; default: auraN = 6; }
     for (int i = auraN; i >= 1; --i) {
         float f01 = (float)i / (float)auraN;                 // 1.0 внешнее .. ~0 внутр.
-        float ex = (5.f + f01 * 25.f) * s * (1.0f + press * 0.35f);
-        float al = (1.0f - f01 / 1.1f);
-        dl->AddRectFilled(ImVec2(a.x - ex, a.y - ex + 3 * s), ImVec2(b.x + ex, b.y + ex + 3 * s),
-                          Fade(g_pal.accentHi, 0.10f * al * auraK), rad + ex, 0);
+        float ex = (4.f + f01 * 26.f) * s * (1.0f + press * 0.35f);
+        float al = (1.0f - f01 * 0.86f);
+        dl->AddRectFilled(ImVec2(a.x - ex, a.y - ex + 2 * s), ImVec2(b.x + ex, b.y + ex + 2 * s),
+                          Fade(g_pal.accentHi, 0.085f * al * auraK), rad + ex, 0);
     }
 
-    // Тень + глянцевое стекло
     SoftShadow(dl, a, b, rad, 14.f * s, IM_COL32(0, 0, 0, 150));
-    dl->AddRectFilled(a, b, IM_COL32(16, 14, 24, 246), rad);
-    // внутренняя акцентная заливка (едва заметная, градиент)
-    dl->AddRectFilledMultiColor(a, ImVec2(b.x, a.y + H * 0.55f),
-        Fade(g_pal.accent, 0.10f + hovA * 0.06f), Fade(g_pal.accentHi, 0.13f + hovA * 0.07f),
-        IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0));
-    // верхний глянец
-    dl->AddRectFilledMultiColor(a, ImVec2(b.x, a.y + H * 0.42f),
-        IM_COL32(255, 255, 255, 22), IM_COL32(255, 255, 255, 22),
-        IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0));
+    // Холодная подложка — тот же тон, что у большой панели.
+    dl->AddRectFilled(a, b, IM_COL32(13, 13, 22, 238), rad);
+    // Свет сверху.
+    dl->AddRectFilledMultiColor(a, ImVec2(b.x, a.y + H * 0.58f),
+        IM_COL32(255, 255, 255, 26), IM_COL32(255, 255, 255, 26),
+        IM_COL32(255, 255, 255, 0),  IM_COL32(255, 255, 255, 0));
+    // Цветная дымка слева направо — источник у бренд-метки.
+    {
+        int aR = (int)((g_pal.accentHi >>  0) & 0xFF);
+        int aG = (int)((g_pal.accentHi >>  8) & 0xFF);
+        int aB = (int)((g_pal.accentHi >> 16) & 0xFF);
+        int ha = (int)((40.f + hovA * 22.f) * glowIntensity); if (ha > 110) ha = 110;
+        dl->AddRectFilledMultiColor(a, b,
+            IM_COL32(aR, aG, aB, ha),     IM_COL32(aR, aG, aB, ha / 4),
+            IM_COL32(aR, aG, aB, 0),      IM_COL32(aR, aG, aB, ha / 6));
+    }
+    // Матовость.
+    if (g_texGrain && ox_uiQuality() < 2)
+        dl->AddImageRounded(g_texGrain, a, b, ImVec2(0, 0),
+            ImVec2(W / Px(96.0f), H / Px(96.0f)),
+            IM_COL32(255, 255, 255, 12), rad);
 
-    // ОБВОДКА — точно в текущем акцентном цвете меню (толстая, яркая)
-    dl->AddRect(a, b, g_pal.accent, rad, 0, (2.4f + press * 1.4f) * s);
-    // вторая тонкая обводка снаружи для глубины
+    // Кромка: яркая по верхней дуге, обычная по контуру.
+    dl->AddRect(a, b, Fade(g_pal.accent, 0.92f), rad, 0, (1.9f + press * 1.2f) * s);
+    dl->PathArcTo(ImVec2(a.x + rad, a.y + rad), rad, 3.1415926f, 4.712389f, 10);
+    dl->PathLineTo(ImVec2(b.x - rad, a.y));
+    dl->PathStroke(IM_COL32(255, 255, 255, 52), 0, 1.3f * s);
     dl->AddRect(ImVec2(a.x - 2 * s, a.y - 2 * s), ImVec2(b.x + 2 * s, b.y + 2 * s),
-                Fade(g_pal.accentHi, 0.35f + hovA * 0.25f), rad + 2 * s, 0, 1.2f * s);
+                Fade(g_pal.accentHi, (0.30f + hovA * 0.25f) * glowIntensity), rad + 2 * s, 0, 1.1f * s);
 
     // Бренд-бейдж слева (встроенный PNG или векторный fallback)
     float bs = H * 0.52f;
@@ -6613,15 +6938,6 @@ static void oxTabESP() {
     // колонке меню, в портрете Layout_tick_UI рисует его рядом над этой вкладкой.
     Section(L_OVERLAY);
     Toggle(L_ENESP, &espdraw);
-    if (Toggle(L_HIDET, &espHideTeammates))
-        cache_needs_update = true;
-    // --- Видимость через стены (зелёный/синий) ---
-    Toggle(L_COLVIS, &espColorByVisibility, L_COLVISH);
-    if (espColorByVisibility) {
-        LegendDot(IM_COL32(60, 230, 110, 255), L_VISIBLE, false);
-        LegendDot(IM_COL32(80, 150, 255, 255), L_BEHIND, true);
-    }
-
     // Источник геометрии и проекции. Оба по умолчанию включены; выключать
     // имеет смысл только для сравнения со старым поведением.
     Toggle(L_ANCHOR, &espModelAnchor, L_ANCHORH);
@@ -6665,7 +6981,6 @@ static void oxTabESP() {
     Toggle(L_WEAPON,   &espweapon);
     Toggle(L_FLAGS,    &espFlags, L_FLAGSH);
     Toggle(L_3DBOX,   &ESP3D);
-    Toggle(L_SKEL,    &skeleton, L_SKELH);
     Toggle(L_LINES, &esplines_enabled);
     if (esplines_enabled) {
         SliderF(L_LINETH, &esplines_thickness, 1.0f, 6.0f, "%.1f");
@@ -6727,15 +7042,10 @@ static void oxTabAim() {
     Segmented(L_TARGET, &aimcurbone, bones, IM_ARRAYSIZE(bones));
     Hint(L_SMOOTHH);
 
-    Section(L_SAFETY);
-    // --- Crouch-safe (bug #4): ручной, т.к. авто-детект приседа недоступен ---
-    Toggle(L_CROUCH, &aimCrouchSafe, L_CROUCHH);
-    if (aimCrouchSafe)
-        SliderF(L_CROUCHD, &aimCrouchDrop, 0.20f, 0.70f, "%.2f");
-    // --- LOS-чек: аим не наводится через стены ---
-    Toggle(L_WALLS, &aimCheckWalls, L_WALLSH);
-    // --- Ignore teammates: аим не наводится на сокомандников ---
-    Toggle(L_IGNTM, &aimIgnoreTeammates, L_IGNTMH);
+    // Секция SAFETY снята целиком: ручной crouch-drop больше не нужен —
+    // присед читается из Motor.CapsuleHeight, и точка прицела строится как
+    // доля от ЖИВОЙ высоты цели, поэтому опускается вместе с ней сама.
+    // Валл-чек и скрытие тимейтов убраны: источники данных пусты в этом билде.
 
     Section(L_PREDICT);
     Toggle(L_MOVPRED, &aimPrediction);
@@ -6777,6 +7087,8 @@ static void oxTabSettings() {
     static const char* ID_ACCPK  = ox_persist(oxorany("accentpick"));
     static const char* ID_ACCPKR = ox_persist(oxorany("##accentPicker"));
     static const char* L_UIOPAC  = ox_persist(oxorany("UI opacity"));
+    static const char* L_GLOW    = ox_persist(oxorany("Glow intensity"));
+    static const char* L_GLOWH   = ox_persist(oxorany("Drives the halo, inner haze and edge light at once."));
     static const char* L_PERF    = ox_persist(oxorany("PERFORMANCE"));
     static const char* L_HSCAN   = ox_persist(oxorany("Heavy scan interval"));
     static const char* L_POSINT  = ox_persist(oxorany("Position interval"));
@@ -6859,6 +7171,64 @@ static void oxTabSettings() {
         ImGui::PopItemWidth();
         ImGui::PopID();
         ImGui::Dummy(ImVec2(0, 10.0f * ps));
+    }
+
+    // Сила подсветки + живой образец материала. Образец показывает ровно те
+    // же слои, что и большая панель, поэтому цвет и свет подбираются по нему,
+    // а не вслепую по значению ползунка.
+    SliderF(L_GLOW, &glowIntensity, 0.0f, 2.0f, "%.2f");
+    Hint(L_GLOWH);
+    {
+        const float ps2 = g_uiScale;
+        ImVec2 gp = ImGui::GetCursorScreenPos();
+        float gw = ImGui::GetContentRegionAvail().x - 32.0f * ps2;
+        float gh = 62.0f * ps2;
+        ImDrawList* gdl = ImGui::GetWindowDrawList();
+        ImVec2 ga(gp.x + 16.0f * ps2, gp.y);
+        ImVec2 gb(ga.x + gw, ga.y + gh);
+        float grr = 16.0f * ps2;
+
+        // Ореол
+        for (int i = 5; i >= 1; --i) {
+            float f01 = (float)i / 5.0f;
+            float ex  = (3.f + f01 * 20.f) * ps2;
+            gdl->AddRectFilled(ImVec2(ga.x - ex, ga.y - ex), ImVec2(gb.x + ex, gb.y + ex),
+                               Fade(g_pal.accentHi, (1.0f - f01 * 0.85f) * 0.07f * glowIntensity),
+                               grr + ex, 0);
+        }
+        // Подложка + свет сверху + дымка + зерно + кромка
+        gdl->AddRectFilled(ga, gb, IM_COL32(13, 13, 22, 236), grr);
+        gdl->AddRectFilledMultiColor(ga, ImVec2(gb.x, ga.y + gh * 0.60f),
+            IM_COL32(255, 255, 255, 24), IM_COL32(255, 255, 255, 24),
+            IM_COL32(255, 255, 255, 0),  IM_COL32(255, 255, 255, 0));
+        {
+            int aR = (int)((g_pal.accentHi >>  0) & 0xFF);
+            int aG = (int)((g_pal.accentHi >>  8) & 0xFF);
+            int aB = (int)((g_pal.accentHi >> 16) & 0xFF);
+            int ha = (int)(38.f * glowIntensity); if (ha > 100) ha = 100;
+            gdl->AddRectFilledMultiColor(ga, gb,
+                IM_COL32(aR, aG, aB, ha),  IM_COL32(aR, aG, aB, ha / 4),
+                IM_COL32(aR, aG, aB, 0),   IM_COL32(aR, aG, aB, ha / 6));
+        }
+        if (g_texGrain)
+            gdl->AddImageRounded(g_texGrain, ga, gb, ImVec2(0, 0),
+                ImVec2(gw / Px(96.0f), gh / Px(96.0f)),
+                IM_COL32(255, 255, 255, 12), grr);
+        gdl->AddRect(ga, gb, Fade(g_pal.accent, 0.55f), grr, 0, 1.5f * ps2);
+        gdl->PathArcTo(ImVec2(ga.x + grr, ga.y + grr), grr, 3.1415926f, 4.712389f, 10);
+        gdl->PathLineTo(ImVec2(gb.x - grr, ga.y));
+        gdl->PathStroke(IM_COL32(255, 255, 255, 50), 0, 1.2f * ps2);
+
+        // Бренд-метка внутри образца — так виден и тон глифа.
+        if (g_texBrandMark) {
+            float bs2 = gh * 0.46f;
+            ImVec2 bc2(ga.x + gh * 0.55f, ga.y + gh * 0.5f);
+            gdl->AddImage(g_texBrandMark,
+                          ImVec2(bc2.x - bs2 * 0.5f, bc2.y - bs2 * 0.5f),
+                          ImVec2(bc2.x + bs2 * 0.5f, bc2.y + bs2 * 0.5f),
+                          ImVec2(0, 0), ImVec2(1, 1), g_pal.accent);
+        }
+        ImGui::Dummy(ImVec2(0, gh + 14.0f * ps2));
     }
 
     static float opacity = 1.0f;
@@ -6969,7 +7339,16 @@ static void FadeDrawListRange(ImDrawList* dl, int vtx0, float k) {
 }
 } // namespace oxui
 
+// Новое меню (ui_v3.cpp) полностью заменяет прежний слой отрисовки.
+// Старый Layout_tick_UI оставлен ниже нетронутым — он больше не вызывается,
+// но остаётся рабочим ориентиром на случай сравнения поведения.
+extern void OxDrawUiV3();
+
 void Layout_tick_UI() {
+    OxDrawUiV3();
+}
+
+[[maybe_unused]] static void Layout_tick_UI_legacy() {
     using namespace oxui;
     // oxorany-литералы меню расшифровываются ОДИН раз. Раньше каждый из ~24
     // ID/строк проходил obfuscation-decrypt КАЖДЫЙ кадр, пока меню открыто
@@ -7064,32 +7443,80 @@ void Layout_tick_UI() {
         const float RND = ::clamp<float>(wsz.y * 0.045f, 22.f, 42.f);
         ImFont* hf = ImGui::GetFont();
 
-        // ── затемнение всего экрана позади панели (dim) ─────────────────────
-        dl->AddRectFilled(ImVec2(0, 0), ds, IM_COL32(0, 0, 0, 150));
+        // ════════════════════════════════════════════════════════════════════
+        //  СТЕКЛО. Настоящего backdrop-blur в ImGui нет — под окном нам не
+        //  доступен кадр игры. Убедительное матовое стекло собирается слоями,
+        //  каждый из которых отвечает за отдельный физический эффект:
+        //
+        //    1. затемнение сцены      — стекло гасит то, что за ним
+        //    2. холодная подложка     — не чёрная: у стекла есть свой оттенок
+        //    3. вертикальный градиент — свет падает сверху
+        //    4. цветная дымка         — подсветка проникает внутрь панели
+        //    5. плёнка зерна          — матовость, «изморозь» на поверхности
+        //    6. кромка сверху-слева   — преломление на грани, самая яркая линия
+        //    7. внешний ореол         — свечение подсветки наружу
+        //
+        //  Все цветные слои берут g_tk.accent, поэтому ползунок подсветки
+        //  меняет вообще всё стекло разом, а не только рамку.
+        // ════════════════════════════════════════════════════════════════════
+        dl->AddRectFilled(ImVec2(0, 0), ds, IM_COL32(4, 4, 9, 170));
 
-        // ── поверхность окна: тень + плоский фон + арт + зерно + рамка ──────
-        SoftShadow(dl, wmin, wmax, RND, g_tk.elev3);
-        dl->AddRectFilled(wmin, wmax, g_tk.bgBase, RND);
+        // Внешний ореол подсветки: несколько растянутых прямоугольников с
+        // падающей альфой. Дышит медленно — стекло выглядит «живым».
         {
-            int iw = 0, ih = 0;
-            ImTextureID bgtex = oxGetMenuBg(&iw, &ih);
-            if (bgtex && iw > 0 && ih > 0) {   // фон-арт cover-fit, приглушён
-                float wr = wsz.x / wsz.y, ir = (float)iw / (float)ih;
-                ImVec2 uv0(0, 0), uv1(1, 1);
-                if (ir > wr) { float t = (wr / ir) * 0.5f; uv0.x = 0.5f - t; uv1.x = 0.5f + t; }
-                else         { float t = (ir / wr) * 0.5f; uv0.y = 0.5f - t; uv1.y = 0.5f + t; }
-                dl->AddImageRounded(bgtex, wmin, wmax, uv0, uv1, IM_COL32(255, 255, 255, 26), RND);
-                dl->AddRectFilled(wmin, wmax, Fade(g_tk.bgDeep, 0.60f), RND);
+            float tGl = (float)ImGui::GetTime();
+            float breath = 0.5f + 0.5f * sinf(tGl * 1.15f);
+            int haloN; switch (ox_uiQuality()) { case 2: haloN = 2; break; case 1: haloN = 4; break; default: haloN = 7; }
+            for (int i = haloN; i >= 1; --i) {
+                float f01 = (float)i / (float)haloN;
+                float ex  = (6.f + f01 * 40.f) * s;
+                float al  = (1.0f - f01 * 0.88f) * (0.055f + 0.022f * breath) * glowIntensity;
+                dl->AddRectFilled(ImVec2(wmin.x - ex, wmin.y - ex),
+                                  ImVec2(wmax.x + ex, wmax.y + ex),
+                                  Fade(g_tk.accentHi, al), RND + ex, 0);
             }
-            // Плёночное зерно (GL_REPEAT тайлится). Очень тонкий слой (alpha 9)
-            // — на minimal-качестве (q2) снимаем: даёт целую draw-команду +
-            // смену текстуры почти без видимого вклада. Визуал q0/q1 не тронут.
-            if (g_texGrain && ox_uiQuality() < 2)
-                dl->AddImageRounded(g_texGrain, wmin, wmax, ImVec2(0, 0),
-                    ImVec2(wsz.x / Px(96.0f), wsz.y / Px(96.0f)),
-                    IM_COL32(255, 255, 255, 9), RND);
         }
-        dl->AddRect(wmin, wmax, Fade(g_tk.accent, 0.42f), RND, 0, g_tk.strokeW * s);
+
+        SoftShadow(dl, wmin, wmax, RND, g_tk.elev3);
+
+        // Подложка: холодный сине-фиолетовый уход в тень, а не плоский чёрный.
+        dl->AddRectFilled(wmin, wmax, IM_COL32(13, 13, 22, 232), RND);
+
+        // Градиент «свет сверху»: верх заметно светлее низа.
+        dl->AddRectFilledMultiColor(wmin, ImVec2(wmax.x, wmin.y + wsz.y * 0.62f),
+            IM_COL32(255, 255, 255, 20), IM_COL32(255, 255, 255, 20),
+            IM_COL32(255, 255, 255, 0),  IM_COL32(255, 255, 255, 0));
+
+        // Цветная дымка подсветки внутри панели — из верхнего-левого угла,
+        // как будто источник света стоит там же, где брендовая метка.
+        {
+            int aR = (int)((g_tk.accentHi >>  0) & 0xFF);
+            int aG = (int)((g_tk.accentHi >>  8) & 0xFF);
+            int aB = (int)((g_tk.accentHi >> 16) & 0xFF);
+            int hazeA = (int)(34.f * glowIntensity);
+            if (hazeA > 90) hazeA = 90;
+            dl->AddRectFilledMultiColor(wmin, ImVec2(wmax.x, wmax.y),
+                IM_COL32(aR, aG, aB, hazeA),
+                IM_COL32(aR, aG, aB, hazeA / 3),
+                IM_COL32(aR, aG, aB, 0),
+                IM_COL32(aR, aG, aB, hazeA / 5));
+        }
+
+        // Матовость: тонкая плёнка зерна поверх цвета.
+        if (g_texGrain && ox_uiQuality() < 2)
+            dl->AddImageRounded(g_texGrain, wmin, wmax, ImVec2(0, 0),
+                ImVec2(wsz.x / Px(96.0f), wsz.y / Px(96.0f)),
+                IM_COL32(255, 255, 255, 13), RND);
+
+        // Кромка. Верх и левый край — яркая светлая линия (преломление),
+        // низ и правый — приглушённая. Это и создаёт «толщину» стекла.
+        dl->AddRect(wmin, wmax, Fade(g_tk.accent, 0.50f), RND, 0, g_tk.strokeW * s);
+        dl->PathArcTo(ImVec2(wmin.x + RND, wmin.y + RND), RND, 3.1415926f, 4.712389f, 12);
+        dl->PathLineTo(ImVec2(wmax.x - RND, wmin.y));
+        dl->PathStroke(IM_COL32(255, 255, 255, 46), 0, 1.4f * s);
+        dl->PathArcTo(ImVec2(wmin.x + RND, wmin.y + RND), RND, 3.1415926f, 2.356194f, 12);
+        dl->PathLineTo(ImVec2(wmin.x, wmax.y - RND));
+        dl->PathStroke(IM_COL32(255, 255, 255, 30), 0, 1.2f * s);
 
         // ── хлебная крошка на всю ширину: "<TAB> / LIVE" + сабтайтл ─────────
         const float headerH = Px(g_tk.sp6 * 2.0f);
