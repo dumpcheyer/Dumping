@@ -54,11 +54,35 @@ void armFull(int frames);
 
 } // namespace oxlog
 
-// Удобные макросы.
-#define OXLOGI(...) oxlog::logf('I', __VA_ARGS__)
-#define OXLOGW(...) oxlog::logf('W', __VA_ARGS__)
-#define OXLOGE(...) oxlog::logf('E', __VA_ARGS__)
-#define OXLOGD(...) oxlog::logf('D', __VA_ARGS__)
-#define OXLOGT(...) oxlog::logf('T', __VA_ARGS__)
+// ============================================================================
+//  РЕЛИЗ: логирование вырезано на этапе компиляции.
+//
+//  Цена одной строки была высокой: vsnprintf, затем ТРИ синхронные операции —
+//  printf + fflush(stdout), __android_log_write и fprintf в файл на /sdcard.
+//  В цикле отрисовки таких вызовов больше десятка, и каждый упирался в диск.
+//
+//  Макросы ниже разворачиваются в do{}while(0): вызова нет, а аргументы всё
+//  равно «упоминаются» через sizeof в невыполняемом контексте — компилятор их
+//  не вычисляет, но и не ругается на неиспользуемые переменные. Строки
+//  форматов при этом полностью исчезают из бинарника.
+//
+//  Собрать с логом обратно: -DOX_ENABLE_LOG.
+// ============================================================================
+#ifdef OX_ENABLE_LOG
+  #define OXLOGI(...) oxlog::logf('I', __VA_ARGS__)
+  #define OXLOGW(...) oxlog::logf('W', __VA_ARGS__)
+  #define OXLOGE(...) oxlog::logf('E', __VA_ARGS__)
+  #define OXLOGD(...) oxlog::logf('D', __VA_ARGS__)
+  #define OXLOGT(...) oxlog::logf('T', __VA_ARGS__)
+#else
+  // sizeof не вычисляет выражение — побочных эффектов у аргументов не будет,
+  // даже если внутри вызов функции.
+  #define OX_LOG_SINK(...) do { (void)sizeof(__VA_ARGS__); } while (0)
+  #define OXLOGI(...) OX_LOG_SINK(__VA_ARGS__)
+  #define OXLOGW(...) OX_LOG_SINK(__VA_ARGS__)
+  #define OXLOGE(...) OX_LOG_SINK(__VA_ARGS__)
+  #define OXLOGD(...) OX_LOG_SINK(__VA_ARGS__)
+  #define OXLOGT(...) OX_LOG_SINK(__VA_ARGS__)
+#endif
 
 #endif // OXLOG_H

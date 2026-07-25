@@ -229,6 +229,39 @@ static constexpr uint64_t DICT_SENTRY_STRIDE   = 0x20;
 static constexpr uint64_t DICT_SENTRY_HASHCODE = 0x0;
 static constexpr uint64_t DICT_SENTRY_KEY      = 0x10;
 static constexpr uint64_t DICT_SENTRY_VALUE    = 0x18;
+// RaycastManager.teamManager(0x28) -> CW: UI-менеджер панели команды.
+// CW.membersList(0x90) — List<nWR>, по строке на каждого сокомандника.
+// nWR.identificator(0x38) — UI.Text с userID участника. Это ТРЕТИЙ независимый
+// путь: он живёт в UI-слое и заполнен, даже когда nWc.team и TeammateStates
+// пустые (панель команды рендерится из своих данных).
+// ── Mirror.NetworkClient (static class, TDI 23916) ─────────────────────────
+// spawned — Dictionary<uint netId, NetworkIdentity> ВСЕХ сетевых объектов,
+// которые знает клиент. Резервный источник построек для LOS: BuildingPiece
+// добавляется в saveList только на СЕРВЕРЕ (OnStartServer), поэтому у клиента
+// тот список пустой (в логах count=0), а spawned заполнен всегда.
+// NetworkIdentity.NetworkBehaviours(0x80) — массив компонентов объекта; среди
+// них и лежит BuildingPiece, опознаваемый по обратной валидации полей.
+// ── ОДНОЗНАЧНЫЙ признак локального игрока ──────────────────────────────────
+// PlayerManager наследует Mirror.NetworkBehaviour, у которого netIdentity
+// лежит на 0x40. В самом NetworkIdentity есть флаг isLocalPlayer (0x4A) —
+// Mirror выставляет его РОВНО ОДНОМУ объекту за матч, тому, которым управляет
+// этот клиент.
+//
+// Это решает старую проблему: ox_localPlayerAlive проверяла лишь наличие
+// MouseLook+RaycastManager, а они есть у ВСЕХ игроков, поэтому «локальным»
+// мог оказаться чужой PM — и базис камеры строился из чужих углов. Свою
+// камеру поворачиваешь, а боксы считаются от чужой: ESP «плавает».
+static constexpr uint64_t NB_NET_IDENTITY      = 0x40; // NetworkIdentity*
+static constexpr uint64_t NI_IS_LOCAL_PLAYER   = 0x4A; // bool isLocalPlayer
+static constexpr uint64_t NI_IS_OWNED          = 0x4B; // bool isOwned
+static constexpr uint64_t NC_SPAWNED_DICT      = 0x28; // static_fields + 0x28
+static constexpr uint64_t NI_NET_ID            = 0x58; // uint netId
+static constexpr uint64_t NI_BEHAVIOURS        = 0x80; // NetworkBehaviour[]
+static constexpr int      SPAWNED_SCAN_MAX     = 4000; // потолок обхода за проход
+static constexpr uint64_t RM_TEAM_MANAGER      = 0x28; // CW* teamManager
+static constexpr uint64_t CW_MEMBERS_LIST      = 0x90; // List<nWR> membersList
+static constexpr uint64_t NWR_NICKNAME         = 0x28; // UI.Text nickname
+static constexpr uint64_t NWR_IDENTIFICATOR    = 0x38; // UI.Text с userID
 static constexpr uint64_t CC_TEAM_ID           = 0x10;
 static constexpr uint64_t CC_TEAM_NAME         = 0x18;
 static constexpr uint64_t CC_TEAM_MEMBERS      = 0x20;
