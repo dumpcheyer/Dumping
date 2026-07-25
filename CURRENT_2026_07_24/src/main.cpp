@@ -1298,7 +1298,27 @@ static uint64_t ox_findKlassInHeap(uint64_t nameVa, uint64_t regionStart, size_t
 //
 // Lazy: s_TypeInfoTable[TDI] == NULL пока класс не заресолвен игрой (metadata usage
 // init при входе в матч). После первого захода — s_TypeInfoTable[8357] = klass.
-static constexpr uint64_t OX_S_TYPEINFO_TABLE_RVA = 0xBF80FF0ULL;  // was 0xBE3BB58
+// ВАЖНО (фикс 2026/07/25): 0xBF80FF0 — это s_MethodInfoDefinitionTable
+// (226854 слотов, индекс = method index), НЕ таблица классов. Обе функции —
+// GetMethodInfoFromMethodDefinitionIndex @0x4dff360 и Class::FromTypeDefinition
+// @0x4e0030c — имеют одинаковую форму (XOR-ключ + sdiv + cache-write), поэтому
+// pattern-скан сел на неправильную.
+//
+// Доказательство из MetadataCache::Initialize @0x4dff4f8:
+//   0x4dff5f8: ldr w8,[header,#0xe8]; eor KEY   -> 29486  (typeDefinitionsCount)
+//   0x4dff618: str x0, [0xBF81040]              -> s_TypeInfoDefinitionTable
+//   0x4dff61c: ldr w8,[header,#0xd0]; eor KEY   -> 226854 (methodsCount)
+//   0x4dff63c: str x0, [0xBF80FF0]              -> s_MethodInfoDefinitionTable
+//
+// Class::FromTypeDefinition @0x4e0030c читает именно 0xBF81040:
+//   0x4e00334: ldr x22, [x8, #0x40]           ; x22 = *(0xBF81040)
+//   0x4e00338: ldr x20, [x22, w0, sxtw #3]    ; klass = table[TDI]
+//   0x4e00604: str x20, [x22, w19, sxtw #3]   ; cache-write
+//
+// Старый билд: 0xBE3BB58. Все metadata-глобалы сдвинулись на +0x1454E8,
+// 0xBE3BB58 + 0x1454E8 = 0xBF81040. Мнемоника на будущее:
+//   s_TypeInfoDefinitionTable = <ctx global> + 0x48  (0xBF80FF8 + 0x48).
+static constexpr uint64_t OX_S_TYPEINFO_TABLE_RVA = 0xBF81040ULL;  // was 0xBF80FF0 (method table!)
 static constexpr uint32_t OX_TDI_PLAYERMANAGER    = 8357;  // was 8251
 static constexpr uint32_t OX_TDI_BUILDINGPIECE    = 8633;  // was 8521
 static constexpr uint32_t OX_TDI_PLAYERVITALS     = 8030;  // was 7923
@@ -1329,7 +1349,7 @@ static bool ox_fastSeedTypeInfoFromHeader() {
     static bool s_logged = false;
     if (!s_logged) {
         s_logged = true;
-        OXLOGI("[fast-seed] s_TypeInfoTable=0x%llx meta_base=0x%llx (offline-verified RVA 0xBF80FF0)",
+        OXLOGI("[fast-seed] s_TypeInfoDefinitionTable=0x%llx meta_base=0x%llx (RVA 0xBF81040, disasm-verified)",
                (unsigned long long)table, (unsigned long long)meta);
     }
 

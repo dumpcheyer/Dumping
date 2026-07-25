@@ -269,13 +269,14 @@ for ins in md.disasm(code, lo):
 - `metadata_base` — тот, к которому прибавляют смещение из header
 - `MetadataCache*` — обычно `s_TypeInfoTable + 8`
 
-Результат 2026/07/24:
+Результат 2026/07/24 (ИСПРАВЛЕНО 2026/07/25 — см. 4.4):
 ```
-s_TypeInfoTable  0xBF80FF0
-MetadataCache*   0xBF80FF8
-metadata_base    0xBF81008
-header ptr       0xBF81010
-stride           0xBF8101C
+s_TypeInfoDefinitionTable  0xBF81040   <- таблица КЛАССОВ (29486, индекс = TDI)
+s_MethodInfoDefinitionTable 0xBF80FF0  <- таблица МЕТОДОВ, НЕ ТРОГАТЬ
+MetadataCache* / ctx        0xBF80FF8
+metadata_base               0xBF81008
+header ptr                  0xBF81010
+stride                      0xBF8101C
 ```
 
 ### 4.3 Проверить layout Il2CppClass
@@ -296,6 +297,69 @@ mono_class_get_parent     -> ldr x0, [x0, #0x58] => parent     @ 0x58
 ```
 `static_fields @ 0xB8` — проверяется через disasm `Class::SetupFields`
 (`bl <alloc>; str x0, [klass, #0xB8]`).
+
+
+### 4.4 ЛОВУШКА: две функции с одинаковой формой
+
+**Это стоило нам целого дня.** В кластере есть ДВЕ функции с идентичной
+структурой (XOR-ключ + `sdiv` + cache-write по индексу). Pattern-скан ловит
+первую попавшуюся, и она почти всегда НЕ ТА.
+
+```
+GetMethodInfoFromMethodDefinitionIndex  @0x4dff360  -> кэш 0xBF80FF0  (226854 слота)
+Class::FromTypeDefinition               @0x4e0030c  -> кэш 0xBF81040  (29486 слотов)  <-- НУЖНА ЭТА
+```
+
+Обе делают `adrp; ldr xT,[xA,#off]; ldr xK,[xT, wIdx, sxtw #3]; ...; str xK,[xT,...]`.
+Отличить можно ТОЛЬКО по тому, какое поле заголовка они делят:
+
+```
+методы:  ldp w10,w9,[header,#0xcc]  ldr w8,[header,#0xc8]   -> recsz 32, count 226854
+классы:  ldp w10,w9,[header,#0xe4]  ldr w8,[header,#0xe0]   -> recsz 82, count 29486
+```
+
+**Надёжный способ — читать `MetadataCache::Initialize`, а не accessor'ы.**
+Там обе таблицы аллоцируются подряд и видно какой размер куда идёт:
+
+```
+0x4dff5f8: ldr w8,[header,#0xe8]; eor KEY   ; 29486  = typeDefinitionsCount
+0x4dff608: bl  alloc(count, 8)
+0x4dff618: str x0, [0xBF81040]              ; <- s_TypeInfoDefinitionTable
+0x4dff61c: ldr w8,[header,#0xd0]; eor KEY   ; 226854 = methodsCount
+0x4dff62c: bl  alloc(count, 8)
+0x4dff63c: str x0, [0xBF80FF0]              ; <- s_MethodInfoDefinitionTable
+```
+
+Как найти `Initialize`: искать функцию, которая пишет в `metadata_base`
+и `header ptr` слоты (`str x?, [0x????008]` / `[0x????010]`), а следом
+делает серию `alloc + str` в соседние слоты.
+
+Скрипт-детектор:
+
+```python
+# в окне кластера ищем: ldr w?,[x?,#IMM] ; eor ; ... ; bl ; str x0,[global]
+# затем расшифровываем header[IMM] ^ 0xA5C3F19D и смотрим что за count:
+#   == typeDefinitionsCount (из шага 2) -> это s_TypeInfoDefinitionTable
+#   иначе                               -> другая таблица, пропускаем
+```
+
+**Мнемоника на будущее:** `s_TypeInfoDefinitionTable = <ctx global> + 0x48`.
+```
+old: 0xBE3BB10 + 0x48 = 0xBE3BB58   ok
+new: 0xBF80FF8 + 0x48 = 0xBF81040   ok
+```
+Все metadata-глобалы между этими билдами сдвинулись **одинаково на +0x1454E8** —
+если нашёл один, остальные считаются вычитанием старой дельты.
+
+### 4.5 Как отличить правильную таблицу на живом устройстве
+
+Прочитать любой заполненный слот и посмотреть `+0x10`:
+- указывает на **читаемую C-строку** (имя класса) -> таблица классов, верно
+- указывает на **код** (`stp x30,x19,[sp,#-0x10]!` = `fe4fbfa9`) -> таблица методов, неверно
+
+Именно так и вскрылась ошибка: `klass+0x10 = base + 0x4b8ed44`, а по этому
+RVA в файле лежит `fe 4f bf a9` — пролог функции, не строка.
+
 
 ---
 
@@ -409,7 +473,7 @@ static constexpr uint64_t OX_META_STRIDE_RVA     = 0x????????;
 
 ### `src/main.cpp` — блок fast-seed (искать `OX_S_TYPEINFO_TABLE_RVA`)
 ```cpp
-static constexpr uint64_t OX_S_TYPEINFO_TABLE_RVA = 0x????????ULL;
+static constexpr uint64_t OX_S_TYPEINFO_TABLE_RVA = 0x????????ULL;  // = ctx + 0x48
 static constexpr uint32_t OX_TDI_PLAYERMANAGER    = ????;   // TDI, не byval!
 static constexpr uint32_t OX_TDI_BUILDINGPIECE    = ????;
 static constexpr uint32_t OX_TDI_PLAYERVITALS     = ????;
@@ -470,6 +534,8 @@ adb shell "su -c 'chmod +x /data/local/tmp/eclipsoxide && /data/local/tmp/eclips
 | В логе | Значит | Что делать |
 |---|---|---|
 | `s_TypeInfoTable slot @ RVA ... = 0x0` | слот пустой или RVA неверный | пересчитать шаг 4 |
+| `имя=''` при непустом klass | **взята таблица методов вместо классов** | см. 4.4 — нужен `+0x48` от ctx-глобала |
+| self-heal обошёл все слоты и не нашёл | та же причина — таблица не та | см. 4.4 |
 | `table[NNNN] = 0x0 (класс ещё не резолвен)` | TDI неверный ИЛИ класс не создан | зайти в матч; если не помогло — сработает self-heal |
 | `[self-heal] НАЙДЕН на TDI NNNN (был MMMM)` | TDI съехал, автопочинка сработала | вписать найденный TDI в исходник |
 | `[self-heal] не найден ни в одном слоте` | таблица не та или имя класса изменилось | пересчитать шаг 4, проверить имя в dump.cs |
@@ -491,6 +557,7 @@ Self-heal (с версии 2026/07/24): если хардкод TDI промах
 [ ] Расшифровал header XOR 0xA5C3F19D, REC вышло 82
 [ ] Нашёл TDI + byval для 9 классов
 [ ] Нашёл 5 RVA-слотов через disasm кластера XOR-ключа
+[ ] ПРОВЕРИЛ что взял таблицу КЛАССОВ, а не методов (раздел 4.4)
 [ ] Сверил Il2CppClass layout (name 0x10, static_fields 0xB8)
 [ ] Перегенерировал dump.cs / il2cpp.h / script.json
 [ ] Сверил field-оффсеты по эталонной таблице
