@@ -14,6 +14,7 @@ LOCAL_SRC_FILES := \
     src/utils.cpp \
     src/oxlog.cpp \
     src/menu_bg.cpp \
+    src/ui_v3.cpp \
     src/LuaIntegration.cpp \
     src/lua_all.cpp \
     src/oxorany/oxorany.cpp \
