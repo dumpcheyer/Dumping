@@ -3077,9 +3077,20 @@ static CameraView ox_getCamera(uint64_t elems, int count, bool full) {
     // Заморожен ли базис текущего выбора? Это ловит именно тот случай, когда
     // указатели валидны, позиции читаются, но углы застыли — ESP «идёт за
     // камерой». Если рядом есть ДРУГОЙ кандидат — переключаемся на него.
+    // ВАЖНО: ox_localPlayerAlive пропускает ЛЮБОГО игрока с валидной связкой
+    // MouseLook+RaycastManager, то есть почти всех в списке — nc упирается в
+    // потолок массива (8). Поэтому условие «frozen && nc > 1» срабатывало
+    // ВСЕГДА, стоило игроку на пару секунд замереть: локальный PM выбрасывался,
+    // выбирался заново, снова замирал — карусель на весь матч (в логе 97
+    // сбросов подряд). А каждый сброс обнулял кэш матрицы камеры, из-за чего
+    // поиск не доживал до использования (viewOff=-1 весь лог).
+    //
+    // Замороженные углы — слишком слабый признак: живой игрок, не трогающий
+    // экран, неотличим от трупа. Геометрический тест ниже (камера должна быть
+    // над ногами своего владельца) решает ту же задачу мгновенно и без ложных
+    // срабатываний, поэтому frozen здесь больше НЕ основание для сброса.
     bool frozen = g_localPlayer && inList && ox_lookFrozen(g_localPlayer, nowSec);
-    if (g_localPlayer && (!inList || !ox_localPlayerAlive(g_localPlayer) ||
-                          (frozen && nc > 1))) {
+    if (g_localPlayer && (!inList || !ox_localPlayerAlive(g_localPlayer))) {
         OXLOGI("[respawn] PM=0x%llx отброшен (inList=%d alive=%d frozen=%d cands=%d)",
                (unsigned long long)g_localPlayer, (int)inList,
                (int)ox_localPlayerAlive(g_localPlayer), (int)frozen, nc);
@@ -4455,13 +4466,11 @@ int main(int argc, char *argv[]) {
                 // наблюдателя углы MouseLook продолжают крутиться, поэтому
                 // детектор по заморозке молчал — и ESP летал после КАЖДОЙ
                 // смерти, пока список игроков не пересобирался сам.
-                bool localDead = false;
-                {
-                    uint8_t resp = rpm<uint8_t>(g_localPlayer + ox::PM_RESPAWNING);
-                    if (resp) localDead = true;
-                    float hp = ox_readHP(g_localPlayer, false);
-                    if (isfinite(hp) && hp >= 0.f && hp <= 0.5f) localDead = true;
-                }
+                // Только PM.respawning. Проверку «HP<=0» убрал: VITALS_HEALTH
+                // (0x88) — это m_MaxHealth, а не текущее здоровье (в логах у
+                // всех ровно 100). Текущее HP синкается и отдельным полем в
+                // дампе не значится, так что та ветка была мёртвой.
+                bool localDead = rpm<uint8_t>(g_localPlayer + ox::PM_RESPAWNING) != 0;
                 if (localDead) {
                     static double s_lastDeadLog = 0.0;
                     double nd = (double)ImGui::GetTime();
@@ -4511,9 +4520,16 @@ int main(int argc, char *argv[]) {
                 if (espMatrixW2S && g_localPlayer)
                     nativeCam = ox_getNativeCamera(g_localPlayer);
 
-                bool ownerChanged = (g_localPlayer != s_lastPm) ||
-                                    (nativeCam && nativeCam != s_lastCam);
-                if (ownerChanged) {
+                // Кэш смещений матриц привязан к КАМЕРЕ, а не к игроку.
+                // Раньше сюда входила и смена g_localPlayer — а он скакал
+                // 0 -> PM -> 0 по несколько раз в секунду из-за карусели выше,
+                // и каждый скачок стирал уже найденные смещения. Поиск
+                // стартовал заново и снова стирался, матрица не доживала до
+                // применения. Теперь сбрасываем ТОЛЬКО когда сменился сам
+                // указатель нативной камеры — это и есть настоящий признак
+                // того, что мы смотрим на другой объект.
+                bool camChanged = (nativeCam && s_lastCam && nativeCam != s_lastCam);
+                if (camChanged) {
                     // Гистерезис ниже НЕ должен переживать смену владельца —
                     // иначе он же и удержит протухшую VP на несколько кадров.
                     g_camVPValid  = false;
@@ -4523,10 +4539,9 @@ int main(int argc, char *argv[]) {
                     g_camProjMatOff = -1;
                     g_camNativeCached = 0;
                     cache_needs_update = true;
-                    if (g_localPlayer != s_lastPm)
-                        OXLOGI("[respawn] локальный PM сменился 0x%llx -> 0x%llx, кэш камеры сброшен",
-                               (unsigned long long)s_lastPm,
-                               (unsigned long long)g_localPlayer);
+                    OXLOGI("[respawn] нативная камера сменилась 0x%llx -> 0x%llx, кэш матрицы сброшен",
+                           (unsigned long long)s_lastCam,
+                           (unsigned long long)nativeCam);
                 }
                 s_lastPm  = g_localPlayer;
                 if (nativeCam) s_lastCam = nativeCam;
@@ -4560,8 +4575,15 @@ int main(int argc, char *argv[]) {
                     int anchored = 0;
                     for (const auto& pl : cached_players)
                         if (pl.usedModelAnchor) anchored++;
-                    OXLOGI("[w2s] matrix=%d viewOff=%d projOff=%d | anchors=%d/%d",
+                    // nativeCam=0 сразу показывает, что до объекта камеры мы
+                    // вообще не дошли (PM пустой / цепочка рвётся), а не что
+                    // поиск шёл и не нашёл. Без этого «viewOff=-1» выглядел
+                    // одинаково в обоих случаях.
+                    uint64_t dbgCam = g_localPlayer ? ox_getNativeCamera(g_localPlayer) : 0;
+                    OXLOGI("[w2s] matrix=%d viewOff=%d projOff=%d | pm=0x%llx nativeCam=0x%llx | anchors=%d/%d",
                            (int)g_camVPValid, g_camViewMatOff, g_camProjMatOff,
+                           (unsigned long long)g_localPlayer,
+                           (unsigned long long)dbgCam,
                            anchored, (int)cached_players.size());
 
                     // Если ни одного якоря — разбираем ПЕРВУЮ живую цель
