@@ -154,6 +154,14 @@ struct PlayerCacheData {
     std::string teamName;
     bool isVisibleTop;
     bool isVisibleBottom;
+    // Якоря модели (KCC.head + Motor.LastInterpolatedPosition). Заполняются
+    // когда espModelAnchor смог прочитать цепочку; тогда бокс/скелет/LOS
+    // строятся по фактическим габаритам, а не по серверному тику + оффсет.
+    bool    usedModelAnchor = false;
+    Vector3 anchorFeet{0,0,0};
+    Vector3 anchorHead{0,0,0};
+    bool    anchorCrouching = false;  // цель сидит (капсула просела)
+    Vector3 motorVelocity{0,0,0};     // скорость из Motor.BaseVelocity
     // Флаги состояния цели (PlayerManager.playerFlags + отдельные bool'ы).
     bool flagSleeping   = false;   // спит — обычно не атакуют
     bool flagSpectating = false;   // в режиме наблюдателя
@@ -539,6 +547,29 @@ bool aimCheckWalls = true;
 bool aimIgnoreTeammates = true;   // Аим пропускает сокомандников (team-key == local's team)
 bool espColorByVisibility = true; // true — видимый=зелёный, за стеной=синий
 // --- Новый пакет фич (всё на чтении) ---
+// Unity Matrix4x4 в памяти лежит column-major: m00 m10 m20 m30 m01 m11 ...
+struct OxMat4 { float m[16]; };
+bool espModelAnchor = true; // ESP по трансформам модели вместо серверного тика
+// Матричный W2S: берём worldToCameraMatrix/projectionMatrix прямо из нативной
+// камеры вместо реконструкции базиса из углов. Смещения ищутся по подписи один
+// раз за сессию; если не нашлись — тихо работаем по старому пути.
+bool espMatrixW2S  = true;
+static OxMat4 g_camVP;          // VP этого кадра
+static OxMat4 g_camView;        // сырая view-матрица (для позиции камеры)
+static bool   g_camVPValid = false;
+static Vector3 g_camPosFromMatrix{0,0,0};
+static bool    g_camPosValid = false;
+
+float espBoxYOffset = -1.84f;
+// espBoxYOffset (-1.84) калибровался под УГЛОВУЮ проекцию, которая сама вносила
+// вертикальный сдвиг. Матричная проекция геометрически верна, поэтому тот же
+// оффсет становится чистым смещением бокса на 1.84 м ВНИЗ — ровно симптом
+// «игрок выше чем ESP». При активной матрице привязку берём нулевую:
+// lastTickPosition — это позиция НОГ, значит низ бокса = pos, верх = pos+1.85.
+static inline float ox_boxYOffset() {
+    return g_camVPValid ? 0.0f : espBoxYOffset;
+}
+
 bool espDistColor  = false; // цвет бокса по дистанции: близко=красный, далеко=синий
 bool espArmor      = false; // показывать броню рядом с HP
 bool espFlags      = false; // метки Sleeping / Spectating / Prime
@@ -620,7 +651,6 @@ float espCornerLength = 0.28f;
 // статически не определить. Наблюдение с устройства: бокс встаёт ВЫШЕ цели,
 // значит pivot не на ногах — компенсируем сдвигом вниз. Слайдер в меню
 // ESP -> BOX -> Vertical offset, чтобы подобрать вживую без пересборки.
-float espBoxYOffset = -1.84f;
 
 template<typename T>
 T get_prop(uint64_t player, const char* tag) {
@@ -1961,8 +1991,103 @@ static std::string ox_teamKey(uint64_t player) {
 //   pf  + 0x20                -> List<TeamMember>
 //   TeamMember + 0x10         -> string id  == PM.userID цели (0x278)
 // Возвращает true если target числится в команде локального игрока.
+// Обходит Dictionary<string,V> и отдаёт КЛЮЧИ (managed-строки) в колбэк.
+// Нужен для nWc.TeammateStates, где ключ — userID сокомандника.
+template <typename CB>
+static int ox_forEachDictStringKeys(uint64_t dictObj, CB&& cb) {
+    if (!ox_isPtr(dictObj)) return -1;
+    uint64_t entries = rpm<uint64_t>(dictObj + ox::DICT_ENTRIES);
+    if (!ox_isPtr(entries)) return -1;
+    int count = rpm<int>(dictObj + ox::DICT_COUNT);
+    if (count <= 0 || count > 64) return -1;          // команда не бывает большой
+    uint64_t arrLen = rpm<uint64_t>(entries + ox::ARRAY_COUNT);
+    if (arrLen == 0 || arrLen > 256) return -1;
+    if ((uint64_t)count > arrLen) count = (int)arrLen;
+
+    uint64_t dataBase = entries + ox::ARRAY_DATA;
+    size_t bytes = (size_t)count * (size_t)ox::DICT_SENTRY_STRIDE;
+    std::vector<uint8_t> buf(bytes);
+    if (!vm_readv(dataBase, buf.data(), bytes)) return -1;
+
+    int seen = 0;
+    for (int i = 0; i < count; ++i) {
+        const uint8_t* e = buf.data() + (size_t)i * ox::DICT_SENTRY_STRIDE;
+        int32_t hashCode; memcpy(&hashCode, e + ox::DICT_SENTRY_HASHCODE, 4);
+        if (hashCode < 0) continue;
+        uint64_t keyPtr; memcpy(&keyPtr, e + ox::DICT_SENTRY_KEY, 8);
+        if (!ox_isPtr(keyPtr)) continue;
+        cb(keyPtr);
+        ++seen;
+    }
+    return seen;
+}
+
+// Разовая диагностика цепочки команды (раз в 3 сек), чтобы видеть где рвётся:
+// PM.team(0x120) -> nWc.team(0x90) -> Cc.dCI(0x20) -> List<TeamMember>.
+static void ox_logTeamChain(uint64_t localPm, uint64_t targetPm) {
+    static double s_last = 0.0;
+    double now = (double)ImGui::GetTime();
+    if (now - s_last < 3.0) return;
+    s_last = now;
+
+    uint64_t lw  = rpm<uint64_t>(localPm  + ox::PM_TEAM);
+    uint64_t tw  = rpm<uint64_t>(targetPm + ox::PM_TEAM);
+    uint64_t lpf = ox_isPtr(lw) ? rpm<uint64_t>(lw + ox::WNN_TEAM_DATA) : 0;
+    uint64_t tpf = ox_isPtr(tw) ? rpm<uint64_t>(tw + ox::WNN_TEAM_DATA) : 0;
+    int size = -1;
+    if (ox_isPtr(lpf)) {
+        uint64_t list = rpm<uint64_t>(lpf + ox::PF_TEAM_MEMBERS);
+        if (ox_isPtr(list)) size = rpm<int>(list + ox::LIST_SIZE);
+    }
+    std::string tid = ox_readStringKey(rpm<uint64_t>(targetPm + ox::PM_USER_ID));
+    // Состояние словаря сокомандников — теперь основной источник.
+    uint64_t states = ox_isPtr(lw) ? rpm<uint64_t>(lw + ox::NWC_TEAMMATE_STATES) : 0;
+    int stCount = ox_isPtr(states) ? rpm<int>(states + ox::DICT_COUNT) : -1;
+    int online  = ox_isPtr(lw) ? rpm<int>(lw + ox::NWC_ONLINE) : -1;
+
+    OXLOGI("[team] lw=0x%llx lpf=0x%llx roster=%d | states=0x%llx cnt=%d online=%d | tid='%s'",
+           (unsigned long long)lw, (unsigned long long)lpf, size,
+           (unsigned long long)states, stCount, online, tid.c_str());
+
+    // Печатаем сами ключи словаря — по ним видно, совпадает ли формат с
+    // PM.userID цели (оба должны быть одинаковыми hex-строками).
+    if (ox_isPtr(states) && stCount > 0) {
+        int shown = 0;
+        ox_forEachDictStringKeys(states, [&](uint64_t k) {
+            if (shown >= 3) return;
+            std::string ks = ox_readStringKey(k);
+            OXLOGI("[team]   mate[%d]='%s'", shown, ks.c_str());
+            shown++;
+        });
+    }
+}
+
 static bool ox_isTeammate(uint64_t localPm, uint64_t targetPm) {
     if (!ox_isPtr(localPm) || !ox_isPtr(targetPm) || localPm == targetPm) return false;
+    if (espHideTeammates || aimIgnoreTeammates) ox_logTeamChain(localPm, targetPm);
+
+    // ── ГЛАВНЫЙ ПУТЬ: nWc.TeammateStates ───────────────────────────────────
+    // В этом билде nWc.team(0x90) приходит нулём даже когда игрок в команде,
+    // поэтому старая цепочка через pf молча ничего не скрывала. А словарь
+    // состояний заполнен, и его ключи — это userID сокомандников.
+    {
+        uint64_t lw = rpm<uint64_t>(localPm + ox::PM_TEAM);
+        if (ox_isPtr(lw)) {
+            uint64_t states = rpm<uint64_t>(lw + ox::NWC_TEAMMATE_STATES);
+            if (ox_isPtr(states)) {
+                std::string tid = ox_readStringKey(rpm<uint64_t>(targetPm + ox::PM_USER_ID));
+                if (!tid.empty()) {
+                    bool found = false;
+                    ox_forEachDictStringKeys(states, [&](uint64_t keyStr) {
+                        if (found) return;
+                        std::string k = ox_readStringKey(keyStr);
+                        if (!k.empty() && k == tid) found = true;
+                    });
+                    if (found) return true;
+                }
+            }
+        }
+    }
 
     // Быстрый путь: одинаковый pf-объект = одна команда.
     uint64_t lw = rpm<uint64_t>(localPm  + ox::PM_TEAM);
@@ -1970,11 +2095,25 @@ static bool ox_isTeammate(uint64_t localPm, uint64_t targetPm) {
     uint64_t lpf = ox_isPtr(lw) ? rpm<uint64_t>(lw + ox::WNN_TEAM_DATA) : 0;
     uint64_t tpf = ox_isPtr(tw) ? rpm<uint64_t>(tw + ox::WNN_TEAM_DATA) : 0;
     if (ox_isPtr(lpf) && lpf == tpf) return true;
+
+    // Резерв: у nWc есть ВТОРОЙ путь к данным команды — поле team(0x90) типа Cc
+    // (тот же объект, что pf). Если WNN_TEAM_DATA указывает не туда после
+    // обновления, сверяем по нему; совпадение указателей = одна команда.
+    if (!ox_isPtr(lpf) || lpf != tpf) {
+        uint64_t lcc = ox_isPtr(lw) ? rpm<uint64_t>(lw + ox::NWC_TEAM_DATA) : 0;
+        uint64_t tcc = ox_isPtr(tw) ? rpm<uint64_t>(tw + ox::NWC_TEAM_DATA) : 0;
+        if (ox_isPtr(lcc) && lcc == tcc) return true;
+        // И берём его как источник ростера, если основной пуст.
+        if (!ox_isPtr(lpf) && ox_isPtr(lcc)) lpf = lcc;
+    }
+
     if (!ox_isPtr(lpf)) return false;   // мы не в команде — скрывать некого
 
     // Медленный, но железный путь: сверяем userID по списку участников.
-    std::string myId = ox_readStringKey(rpm<uint64_t>(targetPm + ox::PM_USER_ID));
-    if (myId.empty()) return false;
+    // Берём ID ЦЕЛИ и ищем его в НАШЕМ ростере — так проверка не зависит от
+    // того, заполнены ли строковые поля у нас самих.
+    std::string targetId = ox_readStringKey(rpm<uint64_t>(targetPm + ox::PM_USER_ID));
+    if (targetId.empty()) return false;
 
     uint64_t list = rpm<uint64_t>(lpf + ox::PF_TEAM_MEMBERS);
     if (!ox_isPtr(list)) return false;
@@ -1987,7 +2126,7 @@ static bool ox_isTeammate(uint64_t localPm, uint64_t targetPm) {
         uint64_t tm = rpm<uint64_t>(elems + i * 8);
         if (!ox_isPtr(tm)) continue;
         std::string id = ox_readStringKey(rpm<uint64_t>(tm + ox::TEAMMEMBER_ID));
-        if (!id.empty() && id == myId) return true;
+        if (!id.empty() && id == targetId) return true;
     }
     return false;
 }
@@ -2104,6 +2243,358 @@ static bool ox_transformWorld(uint64_t transform, Vector3 *pos, Quat *rot, bool 
 }
 
 // ============================================================================
+//  МАТРИЦА КАМЕРЫ — забираем у игры то, чем она РИСУЕТ кадр
+//
+//  Сейчас базис камеры реконструируется из углов MouseLook + FOV из FPManager.
+//  Это работает, но это ПРИБЛИЖЕНИЕ: любая правка, которую движок вносит в
+//  матрицу (шейк, отдача, наклон, нестандартный projection при ADS) мимо нас.
+//
+//  Правильный источник — сама матрица:
+//    RaycastManager.m_WorldCamera(0x30) -> UnityEngine.Camera (managed)
+//    Camera + OBJ_CACHED_PTR(0x10)      -> нативный объект камеры (в libunity)
+//    нативный объект + ???              -> worldToCameraMatrix / projectionMatrix
+//
+//  Последнее смещение зависит от версии Unity и живёт в libunity.so, поэтому
+//  захардкодить его нельзя. Зато матрицу можно НАЙТИ по подписи:
+//    * view-матрица: последняя строка ровно (0,0,0,1), верхний блок 3x3
+//      ортонормирован (длина каждой строки == 1 с точностью до 1e-3)
+//    * projection: столбцовая форма Unity — m00,m11 != 0, m23 == -1 либо 1,
+//      остальные элементы вне диагонали и последнего столбца == 0
+//
+//  Сканируем ОДИН объект в окне 0x400 байт с шагом 4. Это ~256 точечных чтений
+//  один раз за сессию, не массовый скан памяти — watchdog на такое не реагирует.
+// ============================================================================
+
+
+// Кэш найденных смещений. -1 = ещё не искали, -2 = искали и не нашли.
+static int      g_camViewMatOff = -1;
+static int      g_camProjMatOff = -1;
+static uint64_t g_camNativeCached = 0;   // для какого нативного объекта нашли
+
+// Проверка: похоже ли на матрицу вида (world->camera).
+// Последняя строка (0,0,0,1) + ортонормированный поворот 3x3.
+static bool ox_looksLikeViewMatrix(const OxMat4 &M) {
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(M.m[i]) || fabsf(M.m[i]) > 1e6f) return false;
+    }
+    // Unity Matrix4x4 в памяти: m00 m10 m20 m30 m01 m11 ... (column-major).
+    // Последний столбец в памяти — элементы 12..15 = m03 m13 m23 m33.
+    // Для view-матрицы m33 == 1, а строка (m30,m31,m32) == 0.
+    if (fabsf(M.m[3])  > 1e-4f) return false;   // m30
+    if (fabsf(M.m[7])  > 1e-4f) return false;   // m31
+    if (fabsf(M.m[11]) > 1e-4f) return false;   // m32
+    if (fabsf(M.m[15] - 1.0f) > 1e-4f) return false; // m33
+
+    // Три базисных вектора (столбцы 0..2, без трансляции) должны быть единичными.
+    float l0 = sqrtf(M.m[0]*M.m[0] + M.m[1]*M.m[1] + M.m[2]*M.m[2]);
+    float l1 = sqrtf(M.m[4]*M.m[4] + M.m[5]*M.m[5] + M.m[6]*M.m[6]);
+    float l2 = sqrtf(M.m[8]*M.m[8] + M.m[9]*M.m[9] + M.m[10]*M.m[10]);
+    if (fabsf(l0 - 1.f) > 2e-3f) return false;
+    if (fabsf(l1 - 1.f) > 2e-3f) return false;
+    if (fabsf(l2 - 1.f) > 2e-3f) return false;
+
+    // И взаимно перпендикулярными.
+    float d01 = M.m[0]*M.m[4] + M.m[1]*M.m[5] + M.m[2]*M.m[6];
+    float d02 = M.m[0]*M.m[8] + M.m[1]*M.m[9] + M.m[2]*M.m[10];
+    if (fabsf(d01) > 3e-3f || fabsf(d02) > 3e-3f) return false;
+
+    // Трансляция не должна быть нулевой (иначе это просто identity-заглушка).
+    float t = fabsf(M.m[12]) + fabsf(M.m[13]) + fabsf(M.m[14]);
+    if (t < 1e-4f) return false;
+    return true;
+}
+
+// Проверка: похоже ли на проекционную матрицу перспективы.
+// Unity column-major: m00 на [0], m11 на [5], m22 на [10], m23 на [11], m32 на [14].
+static bool ox_looksLikeProjMatrix(const OxMat4 &M) {
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(M.m[i]) || fabsf(M.m[i]) > 1e6f) return false;
+    }
+    // Диагональные множители FOV: осмысленный диапазон для игровых камер.
+    if (M.m[0] < 0.15f || M.m[0] > 12.f) return false;   // m00
+    if (M.m[5] < 0.15f || M.m[5] > 12.f) return false;   // m11
+    // m23 == -1 для right-handed перспективы Unity.
+    if (fabsf(M.m[11] + 1.0f) > 1e-3f) return false;
+    // m33 == 0 у перспективы (у ортографической было бы 1).
+    if (fabsf(M.m[15]) > 1e-4f) return false;
+    // Нули там, где их требует форма перспективной матрицы.
+    const int zeros[] = {1, 2, 3, 4, 6, 7, 12, 13};
+    for (int z : zeros) if (fabsf(M.m[z]) > 1e-4f) return false;
+    // m22 отрицательный (far/near диапазон), m32 отрицательный.
+    if (M.m[10] > 0.f || M.m[14] > 0.f) return false;
+    return true;
+}
+
+// Ищет смещения обеих матриц внутри нативного объекта камеры.
+// Вызывать редко: результат кэшируется до смены объекта камеры.
+static void ox_findCameraMatrices(uint64_t nativeCam) {
+    if (!ox_isPtr(nativeCam)) return;
+    if (nativeCam == g_camNativeCached && g_camViewMatOff != -1) return;
+
+    g_camNativeCached = nativeCam;
+    g_camViewMatOff = -2;
+    g_camProjMatOff = -2;
+
+    // Окно поиска. Матрицы в UnityEngine::Camera лежат в первых ~1 КБ.
+    const int WINDOW = 0x600;
+    const int STEP   = 4;
+
+    for (int off = 0; off + 64 <= WINDOW; off += STEP) {
+        OxMat4 M;
+        if (!vm_readv(nativeCam + off, &M, sizeof(M))) continue;
+
+        if (g_camViewMatOff == -2 && ox_looksLikeViewMatrix(M)) {
+            g_camViewMatOff = off;
+            OXLOGI("[cammat] view-матрица найдена @+0x%X  t=(%.2f %.2f %.2f)",
+                   off, M.m[12], M.m[13], M.m[14]);
+        }
+        if (g_camProjMatOff == -2 && ox_looksLikeProjMatrix(M)) {
+            g_camProjMatOff = off;
+            OXLOGI("[cammat] proj-матрица найдена @+0x%X  m00=%.4f m11=%.4f",
+                   off, M.m[0], M.m[5]);
+        }
+        if (g_camViewMatOff >= 0 && g_camProjMatOff >= 0) break;
+    }
+
+    if (g_camViewMatOff < 0)
+        OXLOGI("[cammat] view-матрица НЕ найдена в окне 0x%X", WINDOW);
+    if (g_camProjMatOff < 0)
+        OXLOGI("[cammat] proj-матрица НЕ найдена в окне 0x%X", WINDOW);
+}
+
+// Достаёт нативный объект камеры из PM. Возвращает 0 если не вышло.
+static uint64_t ox_getNativeCamera(uint64_t player) {
+    if (!ox_isPtr(player)) return 0;
+    uint64_t rm = rpm<uint64_t>(player + ox::PM_RAYCASTMANAGER);
+    if (!ox_isPtr(rm)) return 0;
+    uint64_t camManaged = rpm<uint64_t>(rm + ox::RM_WORLD_CAMERA);
+    if (!ox_isPtr(camManaged)) return 0;
+    uint64_t native = rpm<uint64_t>(camManaged + ox::OBJ_CACHED_PTR);
+    return ox_isPtr(native) ? native : 0;
+}
+
+// Позиция камеры ИЗ view-матрицы. Для ортонормированной view-матрицы
+// V = [R | t], где t = -R * eye, поэтому eye = -R^T * t.
+// Критично для аимбота: углы доворота обязаны считаться от ТОЙ ЖЕ точки, из
+// которой строится проекция. Если брать позицию из worldCameraRoot (наша
+// реконструкция), а проецировать матрицей — прицел уезжает по вертикали
+// ровно на разницу этих двух точек. Это и был симптом «целит выше игрока».
+static bool ox_cameraPosFromView(const OxMat4 &V, Vector3 *out) {
+    if (!out) return false;
+    // Column-major: столбец i = {V.m[i*4+0], V.m[i*4+1], V.m[i*4+2]}.
+    // R^T * t: строки R — это компоненты одного индекса по всем столбцам.
+    float tx = V.m[12], ty = V.m[13], tz = V.m[14];
+    out->x = -(V.m[0]*tx + V.m[1]*ty + V.m[2]*tz);
+    out->y = -(V.m[4]*tx + V.m[5]*ty + V.m[6]*tz);
+    out->z = -(V.m[8]*tx + V.m[9]*ty + V.m[10]*tz);
+    return isfinite(out->x) && isfinite(out->y) && isfinite(out->z);
+}
+
+// Читает VP = proj * view из нативной камеры. false если смещения неизвестны.
+static bool ox_readViewProjection(uint64_t nativeCam, OxMat4 *outVP) {
+    if (!outVP || !ox_isPtr(nativeCam)) return false;
+    if (g_camViewMatOff < 0 || g_camProjMatOff < 0) return false;
+
+    OxMat4 V, P;
+    if (!vm_readv(nativeCam + g_camViewMatOff, &V, sizeof(V))) return false;
+    if (!vm_readv(nativeCam + g_camProjMatOff, &P, sizeof(P))) return false;
+    if (!ox_looksLikeViewMatrix(V) || !ox_looksLikeProjMatrix(P)) return false;
+
+    g_camView = V;
+    g_camPosValid = ox_cameraPosFromView(V, &g_camPosFromMatrix);
+
+    // Column-major умножение: VP = P * V.
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            float sum = 0.f;
+            for (int k = 0; k < 4; k++)
+                sum += P.m[k * 4 + r] * V.m[c * 4 + k];
+            outVP->m[c * 4 + r] = sum;
+        }
+    }
+    return true;
+}
+
+// World -> screen через настоящую VP-матрицу игры.
+// Возвращает false если точка за камерой или матрицы недоступны.
+static bool ox_w2sMatrix(const OxMat4 &VP, const Vector3 &p,
+                         float screenW, float screenH, ImVec2 *out) {
+    if (!out) return false;
+    float cx = VP.m[0]*p.x + VP.m[4]*p.y + VP.m[8]*p.z  + VP.m[12];
+    float cy = VP.m[1]*p.x + VP.m[5]*p.y + VP.m[9]*p.z  + VP.m[13];
+    float cw = VP.m[3]*p.x + VP.m[7]*p.y + VP.m[11]*p.z + VP.m[15];
+    if (cw < 0.01f) return false;             // за камерой
+    float ndcX = cx / cw, ndcY = cy / cw;
+    if (!isfinite(ndcX) || !isfinite(ndcY)) return false;
+    out->x = (ndcX * 0.5f + 0.5f) * screenW;
+    out->y = (1.f - (ndcY * 0.5f + 0.5f)) * screenH;   // Y вниз в экранных
+    return true;
+}
+
+// ============================================================================
+//  ЯКОРЯ МОДЕЛИ — привязка ESP к тому, что игра РИСУЕТ, а не к серверному тику
+//
+//  Проблема старого пути: позиция бралась из PM.lastTickPosition (0x1C8) —
+//  это серверный тик, 10-20 Гц. Модель на экране между тиками движется
+//  интерполированно, поэтому бокс отставал от бегущей цели на 0.5-1 м, и
+//  вертикальную привязку приходилось подгонять руками (espBoxYOffset).
+//
+//  Новый путь берёт данные ровно из тех объектов, по которым игра строит кадр:
+//    KCC.head (0x88)                      -> Transform головы, интерполирован
+//    KCC.Motor(0x68).LastInterpolatedPosition(0x1EC) -> позиция ног этого кадра
+//
+//  Габариты бокса теперь ФАКТИЧЕСКИЕ (от ног до головы), а не «позиция + 1.8 м
+//  на глаз». Вертикальный оффсет при этом не нужен вообще.
+// ============================================================================
+
+struct OxModelAnchors {
+    Vector3 head{0,0,0};    // мировая позиция головы (реальная кость)
+    Vector3 feet{0,0,0};    // мировая позиция ног (интерполированная мотором)
+    float   height = 0.f;   // фактический рост = head.y - feet.y
+    bool    valid  = false;
+    // Диагностика: на каком шаге оборвалась цепочка.
+    // 0 = ок, 1 = нет kccReference, 2 = не нашли KCC ни в обёртке ни напрямую,
+    // 3 = не прочитался трансформ головы, 4 = нет позиции ног,
+    // 5 = геометрия не прошла санити (см. lastDy / lastDxz).
+    int      failStage = 0;
+    uint64_t kccPtr    = 0;
+    float    lastDy    = 0.f;
+    float    lastDxz   = 0.f;
+    // Живые данные капсулы: высота этого кадра и признак приседа.
+    uint64_t headTr    = 0;     // Transform головы (для диагностики stage 3)
+    uint64_t headCached = 0;    // его m_CachedPtr
+    uint64_t headMatrix = 0;    // matrixData внутри нативного трансформа
+    bool     headFromCapsule = false; // голова взята геометрически, не из кости
+    float    capsuleH  = 0.f;   // Motor.CapsuleHeight сейчас
+    float    normalH   = 0.f;   // KCC.normalHeight (рост стоя)
+    bool     crouching = false; // высота просела ниже 85% от нормальной
+    Vector3  velocity{0,0,0};   // Motor.BaseVelocity — точнее численной производной
+};
+
+// Читает якоря модели игрока. ~6 точечных vm_readv, никаких сканов.
+// Возвращает valid=false если цепочка оборвана или геометрия не прошла
+// санити-чек — вызывающий тогда откатывается на старый путь.
+static OxModelAnchors ox_readModelAnchors(uint64_t player) {
+    OxModelAnchors a;
+    if (!ox_isPtr(player)) return a;
+
+    // PM.kccReference — это InterfaceReference<sA>, MANAGED-ОБЪЁКТ, а не сам KCC.
+    // В дампе его поле _component значится на +0x0, но это смещение внутри
+    // блока данных: у managed-объекта первые 0x10 байт занимает заголовок
+    // (klass + monitor). Реальный KCC лежит на +0x10 от обёртки.
+    // Пробуем оба варианта — на случай если поле инлайнится напрямую.
+    uint64_t kccRaw = rpm<uint64_t>(player + ox::PM_KCC_REFERENCE);
+    if (!ox_isPtr(kccRaw)) { a.failStage = 1; return a; }
+
+    // Ищем настоящий KCC САМОПРОВЕРКОЙ, а не угадыванием смещения внутри
+    // обёртки: у KCC поле player (+0x78) указывает ОБРАТНО на наш PM. Такое
+    // совпадение случайным быть не может, поэтому проверка однозначна и
+    // переживёт любую перетасовку полей InterfaceReference.
+    auto isRealKcc = [&](uint64_t cand) -> bool {
+        if (!ox_isPtr(cand)) return false;
+        return rpm<uint64_t>(cand + ox::KCC_PLAYER) == player;
+    };
+
+    uint64_t kcc = 0;
+    if (isRealKcc(kccRaw)) {
+        kcc = kccRaw;                       // поле хранит KCC напрямую
+    } else {
+        // Обёртка: перебираем её первые 0x40 байт — _component лежит там.
+        for (int w = 0x00; w <= 0x30 && !kcc; w += 8) {
+            uint64_t cand = rpm<uint64_t>(kccRaw + w);
+            if (isRealKcc(cand)) kcc = cand;
+        }
+    }
+    if (!kcc) { a.failStage = 2; return a; }
+    a.kccPtr = kcc;
+
+    uint64_t headTr = rpm<uint64_t>(kcc + ox::KCC_HEAD);
+    a.headTr = headTr;
+    if (!ox_isPtr(headTr)) { a.failStage = 3; return a; }
+
+    // Внутренности трансформа — фиксируем для диагностики stage 3.
+    a.headCached = rpm<uint64_t>(headTr + ox::OBJ_CACHED_PTR);
+    if (ox_isPtr(a.headCached))
+        a.headMatrix = rpm<uint64_t>(a.headCached + ox::TR_INT_MATRIXPTR);
+
+    // --- Голова: реальный интерполированный трансформ ---
+    // Основной путь — тот же ox_transformWorld, что и у скелета.
+    bool haveHead = ox_transformWorld(headTr, &a.head, nullptr, false, nullptr);
+
+    // ФОЛБЭК: если чтение матрицы трансформа не удалось, берём голову
+    // геометрически — Motor даёт позицию ног и ЖИВУЮ высоту капсулы, а
+    // KCC.head нужен был лишь ради точки глаз. capsuleH это и есть рост.
+    if (!haveHead || !isfinite(a.head.x) || !isfinite(a.head.y) || !isfinite(a.head.z)) {
+        uint64_t m = rpm<uint64_t>(kcc + ox::KCC_MOTOR);
+        if (ox_isPtr(m)) {
+            Vector3 ip = rpm<Vector3>(m + ox::MOTOR_INTERP_POS);
+            float   ch = rpm<float>(m + ox::MOTOR_CAPSULE_HEIGHT);
+            float   lo = rpm<float>(kcc + ox::KCC_LOOK_HEIGHT_OFF);
+            if (isfinite(ip.x) && isfinite(ch) && ch > 0.3f && ch < 3.5f) {
+                if (!isfinite(lo) || lo < -1.f || lo > 1.f) lo = 0.f;
+                // Точка глаз ≈ верх капсулы плюс lookHeightOffset движка.
+                a.head = Vector3(ip.x, ip.y + ch + lo, ip.z);
+                a.headFromCapsule = true;
+                haveHead = true;
+            }
+        }
+    }
+    if (!haveHead) { a.failStage = 3; return a; }
+
+    // --- Ноги: LastInterpolatedPosition моторa — позиция ЭТОГО кадра ---
+    bool haveFeet = false;
+    uint64_t motor = rpm<uint64_t>(kcc + ox::KCC_MOTOR);
+    if (ox_isPtr(motor)) {
+        Vector3 ip = rpm<Vector3>(motor + ox::MOTOR_INTERP_POS);
+        if (isfinite(ip.x) && isfinite(ip.y) && isfinite(ip.z) &&
+            (fabsf(ip.x) > 0.001f || fabsf(ip.z) > 0.001f)) {
+            a.feet = ip; haveFeet = true;
+        }
+    }
+    // Фолбэк: трансформ самого моторa (корень капсулы).
+    if (!haveFeet && ox_isPtr(motor)) {
+        uint64_t mt = rpm<uint64_t>(motor + ox::MOTOR_TRANSFORM);
+        if (ox_isPtr(mt))
+            haveFeet = ox_transformWorld(mt, &a.feet, nullptr, false, nullptr);
+    }
+    // Последний фолбэк: серверный тик (старое поведение).
+    if (!haveFeet) {
+        a.feet = rpm<Vector3>(player + ox::PM_LAST_TICK_POS);
+        if (!isfinite(a.feet.x)) { a.failStage = 4; return a; }
+    }
+
+    // --- Санити: рост человека и голова примерно над ногами ---
+    // Отсекает мусор от переиспользованной памяти и чужие указатели.
+    float dy  = a.head.y - a.feet.y;
+    float dx  = a.head.x - a.feet.x;
+    float dz  = a.head.z - a.feet.z;
+    float dxz = sqrtf(dx*dx + dz*dz);
+    if (!isfinite(dy) || dy < 0.40f || dy > 2.60f || dxz > 1.50f) {
+        a.failStage = 5; a.lastDy = dy; a.lastDxz = dxz; return a;
+    }
+
+    a.lastDy = dy; a.lastDxz = dxz;
+    a.height = dy;
+
+    // --- Живая геометрия капсулы: присед и скорость ---
+    if (ox_isPtr(motor)) {
+        float ch = rpm<float>(motor + ox::MOTOR_CAPSULE_HEIGHT);
+        float nh = rpm<float>(kcc   + ox::KCC_NORMAL_HEIGHT);
+        if (isfinite(ch) && ch > 0.2f && ch < 4.0f) a.capsuleH = ch;
+        if (isfinite(nh) && nh > 0.2f && nh < 4.0f) a.normalH  = nh;
+        if (a.capsuleH > 0.f && a.normalH > 0.f)
+            a.crouching = (a.capsuleH < a.normalH * 0.85f);
+
+        Vector3 v = rpm<Vector3>(motor + ox::MOTOR_BASE_VELOCITY);
+        if (isfinite(v.x) && isfinite(v.y) && isfinite(v.z) &&
+            fabsf(v.x) < 100.f && fabsf(v.y) < 100.f && fabsf(v.z) < 100.f)
+            a.velocity = v;
+    }
+    a.valid  = true;
+    return a;
+}
+
+// ============================================================================
 //  СКЕЛЕТ — чтение реальных костей модели игрока
 //
 //  Цепочка (оффсеты из il2cpp.h дампа 2026/07/24):
@@ -2157,6 +2648,24 @@ static bool ox_readSkeleton(uint64_t player, const Vector3 &feet, PlayerCacheDat
                 if (ox_isPtr(r)) haveRH = ox_transformWorld(r, &rhW, nullptr, false, nullptr);
                 uint64_t l = rpm<uint64_t>(pmi + ox::PMI_LEFT_HAND);
                 if (ox_isPtr(l)) haveLH = ox_transformWorld(l, &lhW, nullptr, false, nullptr);
+            }
+        }
+    }
+
+    // ФОЛБЭК: тот же приём, что и в ox_readModelAnchors — если кость головы
+    // не читается (трансформ есть, а матрица не отдаётся), берём точку глаз
+    // геометрически из живой капсулы моторa. Без этого скелет молча не
+    // рисовался вообще, хотя все остальные данные были на месте.
+    if (!haveHead && ox_isPtr(kcc)) {
+        uint64_t m = rpm<uint64_t>(kcc + ox::KCC_MOTOR);
+        if (ox_isPtr(m)) {
+            Vector3 ip = rpm<Vector3>(m + ox::MOTOR_INTERP_POS);
+            float   ch = rpm<float>(m + ox::MOTOR_CAPSULE_HEIGHT);
+            float   lo = rpm<float>(kcc + ox::KCC_LOOK_HEIGHT_OFF);
+            if (isfinite(ip.x) && isfinite(ch) && ch > 0.3f && ch < 3.5f) {
+                if (!isfinite(lo) || lo < -1.f || lo > 1.f) lo = 0.f;
+                headW = Vector3(ip.x, ip.y + ch + lo, ip.z);
+                haveHead = true;
             }
         }
     }
@@ -3133,7 +3642,41 @@ static Vector3 ox_aimPoint(Vector3 playerPosition) {
     if (aimCrouchSafe) h -= aimCrouchDrop;
     // Та же вертикальная привязка что и у ESP-бокса — иначе прицел уедет
     // относительно того что нарисовано на экране.
-    return playerPosition + Vector3(0.f, espBoxYOffset + h, 0.f);
+    return playerPosition + Vector3(0.f, ox_boxYOffset() + h, 0.f);
+}
+
+// Точка прицеливания по ФАКТИЧЕСКИМ габаритам модели, когда якоря прочитаны.
+// Доли от реального роста вместо абсолютных метров: работает и на приседе, и
+// на нестандартной модели, и не зависит от espBoxYOffset. Если якорей нет —
+// откат на старую формулу, поведение прежнее.
+static Vector3 ox_aimPointFor(const PlayerCacheData& pl) {
+    if (!pl.usedModelAnchor) return ox_aimPoint(pl.position);
+
+    // H — ФАКТИЧЕСКАЯ высота цели В ЭТОМ КАДРЕ. Когда игрок приседает, игра
+    // опускает голову, H уменьшается, и точка прицела едет вниз ВМЕСТЕ с ним.
+    // Никакого ручного «crouch drop» больше не нужно — присед учитывается сам.
+    float H = pl.anchorHead.y - pl.anchorFeet.y;
+    if (!isfinite(H) || H < 0.40f || H > 2.60f) return ox_aimPoint(pl.position);
+
+    // Доли от реального роста, а не абсолютные метры. anchorHead — это точка
+    // KCC.head (уровень глаз/шеи), поэтому:
+    //   1.00 = ровно глаза, 0.90 ≈ центр головы, 0.80 ≈ шея, 0.66 ≈ грудь.
+    float frac;
+    switch (aimcurbone) {
+        case 0: frac = 0.97f; break;  // head — чуть ниже глаз, по центру черепа
+        case 1: frac = 0.86f; break;  // neck
+        default: frac = 0.68f; break; // body — центр массы груди
+    }
+
+    // Ручной crouch-safe оставлен как страховка, но при живом приседе он уже
+    // не нужен: применяем его только когда капсула НЕ показывает присед.
+    if (aimCrouchSafe && !pl.anchorCrouching) frac -= aimCrouchDrop / H;
+    frac = ::clamp<float>(frac, 0.10f, 1.02f);
+
+    // По X/Z берём голову: на бегу корпус наклонён, ноги отстают от торса.
+    return Vector3(pl.anchorHead.x,
+                   pl.anchorFeet.y + H * frac,
+                   pl.anchorHead.z);
 }
 
 // Selects the target nearest the crosshair and adjusts the local MouseLook angles.
@@ -3160,14 +3703,22 @@ static void ox_runAimbot(const CameraView& cam, const std::vector<PlayerCacheDat
              (!g_localTeamName.empty() && !player.teamName.empty() &&
               player.teamName == g_localTeamName))) continue;
         Vector3 livePosition = player.position;
-        Vector3 point = ox_aimPoint(livePosition);
-        float distance = Vector3::Distance(cam.pos, point);
+        Vector3 point = ox_aimPointFor(player);
+        Vector3 eyeDist = (g_camVPValid && g_camPosValid) ? g_camPosFromMatrix : cam.pos;
+        float distance = Vector3::Distance(eyeDist, point);
         if (aimMaxDistance > 0.f && distance > aimMaxDistance) continue;
 
         if (aimPrediction && aimProjectileSpeed > 1.0f) {
             float leadTime = distance / aimProjectileSpeed + aimLatencyMs * 0.001f;
             leadTime = ::clamp<float>(leadTime, 0.0f, aimMaxLeadTime);
-            point += player.velocity * leadTime;
+            // Motor.BaseVelocity — скорость, которой оперирует сам контроллер.
+            // Она не шумит на низком тикрейте, в отличие от нашей численной
+            // производной по позициям, и не даёт «дёрганья» упреждения.
+            Vector3 vel = (player.motorVelocity.x != 0.f ||
+                           player.motorVelocity.y != 0.f ||
+                           player.motorVelocity.z != 0.f)
+                        ? player.motorVelocity : player.velocity;
+            point += vel * leadTime;
         }
 
         // --- LOS-чек (аим не через стены) ---
@@ -3177,12 +3728,25 @@ static void ox_runAimbot(const CameraView& cam, const std::vector<PlayerCacheDat
         // стены при перекрытом теле.
         bool blocked = false;
         if (aimCheckWalls) {
-            blocked = !ox_isTargetVisible(cam.pos, point);
+            Vector3 eyeLos = (g_camVPValid && g_camPosValid) ? g_camPosFromMatrix : cam.pos;
+            blocked = !ox_isTargetVisible(eyeLos, point);
         }
         if (blocked) continue;
 
         bool onScreen = false;
-        ImVec2 screen = w2s_angular(point, cam, &onScreen);
+        ImVec2 screen;
+        if (g_camVPValid) {
+            if (!ox_w2sMatrix(g_camVP, point, (float)abs_ScreenX,
+                              (float)abs_ScreenY, &screen)) {
+                onScreen = false;
+                screen = ImVec2(-1.f, -1.f);
+            } else {
+                onScreen = (screen.x >= 0.f && screen.x <= abs_ScreenX &&
+                            screen.y >= 0.f && screen.y <= abs_ScreenY);
+            }
+        } else {
+            screen = w2s_angular(point, cam, &onScreen);
+        }
         if (aimvisible && !onScreen) continue;
         float dx = screen.x - screenCenter.x;
         float dy = screen.y - screenCenter.y;
@@ -3199,7 +3763,12 @@ static void ox_runAimbot(const CameraView& cam, const std::vector<PlayerCacheDat
     uint64_t mouseLook = rpm<uint64_t>(g_localPlayer + ox::PM_MOUSELOOK);
     if (!ox_isPtr(mouseLook)) return;
 
-    Vector3 delta = bestPoint - cam.pos;
+    // Точка отсчёта углов ОБЯЗАНА совпадать с точкой, из которой строилась
+    // проекция при выборе цели. Иначе прицел уезжает на разницу между
+    // реконструированной камерой и настоящей — это и был баг «целит выше».
+    Vector3 eye = (g_camVPValid && g_camPosValid) ? g_camPosFromMatrix : cam.pos;
+
+    Vector3 delta = bestPoint - eye;
     float horizontalDistance = sqrtf(delta.x * delta.x + delta.z * delta.z);
     if (horizontalDistance < 0.001f) return;
 
@@ -3216,6 +3785,24 @@ static void ox_runAimbot(const CameraView& cam, const std::vector<PlayerCacheDat
     float nextYaw = currentYaw + ox_normalizeAngle(targetYaw - currentYaw) / smooth;
     nextPitch = ::clamp<float>(nextPitch, -80.0f, 80.0f);
     nextYaw = ox_normalizeAngle(nextYaw);
+
+    // Диагностика раз в 2 сек: видно откуда считаются углы и куда целимся.
+    // eyeSrc=M — позиция камеры взята из матрицы (правильно), =R — из
+    // реконструкции (значит матрица не поднялась).
+    {
+        static double s_lastAimLog = 0.0;
+        double nowA = (double)ImGui::GetTime();
+        if (nowA - s_lastAimLog > 2.0) {
+            s_lastAimLog = nowA;
+            OXLOGI("[aim] eyeSrc=%c eye=(%.2f %.2f %.2f) pt=(%.2f %.2f %.2f) "
+                   "dy=%.2f pitch %.1f->%.1f yaw %.1f->%.1f bone=%d",
+                   (g_camVPValid && g_camPosValid) ? 'M' : 'R',
+                   eye.x, eye.y, eye.z,
+                   bestPoint.x, bestPoint.y, bestPoint.z,
+                   delta.y, currentPitch, targetPitch, currentYaw, targetYaw,
+                   aimcurbone);
+        }
+    }
 
     wpm<float>(mouseLook + ox::ML_PITCH, nextPitch);
     wpm<float>(mouseLook + ox::ML_YAW, nextYaw);
@@ -3496,7 +4083,7 @@ void UpdatePlayerCache() {
         w2sLogDetail = (full && valid < 3); // детальная трассировка для первых целей
         // pos = уровень глаз/головы → низ бокса опускаем к ногам, верх чуть выше макушки.
         // espBoxYOffset — живая вертикальная привязка (см. комментарий у глобала).
-        Vector3 anchor = pos + Vector3(0.f, espBoxYOffset, 0.f);
+        Vector3 anchor = pos + Vector3(0.f, ox_boxYOffset(), 0.f);
         data.w2sBottom = w2s_angular(anchor - Vector3(0, ox::BOX_FOOT, 0), cam, &data.isVisibleBottom);
         data.w2sTop    = w2s_angular(anchor + Vector3(0, ox::BOX_HEAD, 0), cam, &data.isVisibleTop);
         w2sLogDetail = false;
@@ -3862,6 +4449,30 @@ int main(int argc, char *argv[]) {
                 // это труп, а замены в списке нет. Рисовать по замороженному
                 // базису нельзя: боксы «прилипнут» к экрану и поедут за
                 // камерой. Лучше не показать ничего, чем показать неверно.
+                // Прямой признак смерти вместо косвенного (замороженные углы):
+                // PM.respawning выставляется игрой на время смерти/респавна, а
+                // HP<=0 закрывает случай, когда флаг ещё не поднялся. В режиме
+                // наблюдателя углы MouseLook продолжают крутиться, поэтому
+                // детектор по заморозке молчал — и ESP летал после КАЖДОЙ
+                // смерти, пока список игроков не пересобирался сам.
+                bool localDead = false;
+                {
+                    uint8_t resp = rpm<uint8_t>(g_localPlayer + ox::PM_RESPAWNING);
+                    if (resp) localDead = true;
+                    float hp = ox_readHP(g_localPlayer, false);
+                    if (isfinite(hp) && hp >= 0.f && hp <= 0.5f) localDead = true;
+                }
+                if (localDead) {
+                    static double s_lastDeadLog = 0.0;
+                    double nd = (double)ImGui::GetTime();
+                    if (nd - s_lastDeadLog > 3.0) {
+                        s_lastDeadLog = nd;
+                        OXLOGI("[respawn] локальный игрок мёртв/респавнится — ESP скрыт, ждём нового PM");
+                    }
+                    liveCam.valid = false;
+                    cache_needs_update = true;   // форсируем пере-выбор владельца
+                }
+
                 if (liveCam.valid && ox_lookFrozen(g_localPlayer, (double)ImGui::GetTime(), 3.0f)) {
                     static double s_lastWarn = 0.0;
                     double nw = (double)ImGui::GetTime();
@@ -3874,6 +4485,108 @@ int main(int argc, char *argv[]) {
                     cache_needs_update = true;   // подтолкнуть пере-выбор
                 }
             }
+            // ── VP-матрица этого кадра, прямо из нативной камеры ──────────
+            // Первый успешный заход ищет смещения по подписи и кэширует их.
+            // Если не нашлись — g_camVPValid остаётся false и весь ESP молча
+            // работает по старому угловому пути.
+            // Матрицу ищем НЕ дожидаясь liveCam.valid: нативная камера живёт
+            // раньше, чем собирается наш реконструированный базис. Раньше
+            // условие требовало liveCam.valid, из-за чего поиск стартовал
+            // только через ~18 секунд после захода — всё это время ESP шёл по
+            // угловому пути и «плавал».
+            {
+                static int      s_missStreak = 0;  // подряд неудачных перечиток
+                static uint64_t s_lastPm     = 0;  // чей PM обслуживали в прошлый кадр
+                static uint64_t s_lastCam    = 0;  // и какая была нативная камера
+
+                // ── СМЕРТЬ/РЕСПАВН ────────────────────────────────────────
+                // После смерти g_localPlayer какое-то время указывает на PM
+                // трупа. Из него ox_getNativeCamera достаёт КАМЕРУ ТРУПА, и
+                // матрица читается из чужого объекта — ESP «улетает». Старый
+                // детектор ловил замороженные углы MouseLook, но в режиме
+                // наблюдателя углы продолжают меняться, поэтому он молчал.
+                // Здесь ловим сам факт подмены: сменился PM или сменился
+                // указатель камеры => немедленно выбрасываем кэш.
+                uint64_t nativeCam = 0;
+                if (espMatrixW2S && g_localPlayer)
+                    nativeCam = ox_getNativeCamera(g_localPlayer);
+
+                bool ownerChanged = (g_localPlayer != s_lastPm) ||
+                                    (nativeCam && nativeCam != s_lastCam);
+                if (ownerChanged) {
+                    // Гистерезис ниже НЕ должен переживать смену владельца —
+                    // иначе он же и удержит протухшую VP на несколько кадров.
+                    g_camVPValid  = false;
+                    g_camPosValid = false;
+                    s_missStreak  = 999;
+                    g_camViewMatOff = -1;      // переискать на новой камере
+                    g_camProjMatOff = -1;
+                    g_camNativeCached = 0;
+                    cache_needs_update = true;
+                    if (g_localPlayer != s_lastPm)
+                        OXLOGI("[respawn] локальный PM сменился 0x%llx -> 0x%llx, кэш камеры сброшен",
+                               (unsigned long long)s_lastPm,
+                               (unsigned long long)g_localPlayer);
+                }
+                s_lastPm  = g_localPlayer;
+                if (nativeCam) s_lastCam = nativeCam;
+
+                bool got = false;
+                if (nativeCam) {
+                    if (g_camViewMatOff == -1 || nativeCam != g_camNativeCached)
+                        ox_findCameraMatrices(nativeCam);
+                    got = ox_readViewProjection(nativeCam, &g_camVP);
+                }
+                if (got) {
+                    s_missStreak = 0;
+                    g_camVPValid = true;
+                } else if (g_camVPValid && ++s_missStreak <= 8) {
+                    // Разовый промах валидации (кадр поймали в момент записи
+                    // матрицы движком) — держим прошлую VP вместо мигания
+                    // между матричным и угловым путём. Оно и давало рывки.
+                } else {
+                    g_camVPValid = false;
+                    g_camPosValid = false;
+                }
+            }
+
+            // Диагностика раз в 2 сек: видно какой путь реально работает и,
+            // если якоря не читаются — на каком именно шаге рвётся цепочка.
+            {
+                static double s_lastDiag = 0.0;
+                double nowD = (double)ImGui::GetTime();
+                if (nowD - s_lastDiag > 2.0 && g_localPlayer) {
+                    s_lastDiag = nowD;
+                    int anchored = 0;
+                    for (const auto& pl : cached_players)
+                        if (pl.usedModelAnchor) anchored++;
+                    OXLOGI("[w2s] matrix=%d viewOff=%d projOff=%d | anchors=%d/%d",
+                           (int)g_camVPValid, g_camViewMatOff, g_camProjMatOff,
+                           anchored, (int)cached_players.size());
+
+                    // Если ни одного якоря — разбираем ПЕРВУЮ живую цель
+                    // по шагам, чтобы точно знать где обрыв.
+                    if (anchored == 0 && !cached_players.empty()) {
+                        for (const auto& pl : cached_players) {
+                            if (!ox_isPtr(pl.address)) continue;
+                            OxModelAnchors dbg = ox_readModelAnchors(pl.address);
+                            uint64_t rawRef = rpm<uint64_t>(pl.address + ox::PM_KCC_REFERENCE);
+                            OXLOGI("[anchor] pm=0x%llx ref=0x%llx kcc=0x%llx stage=%d "
+                                   "headTr=0x%llx cached=0x%llx mat=0x%llx cap=%.2f dy=%.2f dxz=%.2f",
+                                   (unsigned long long)pl.address,
+                                   (unsigned long long)rawRef,
+                                   (unsigned long long)dbg.kccPtr,
+                                   dbg.failStage,
+                                   (unsigned long long)dbg.headTr,
+                                   (unsigned long long)dbg.headCached,
+                                   (unsigned long long)dbg.headMatrix,
+                                   dbg.capsuleH, dbg.lastDy, dbg.lastDxz);
+                            break;
+                        }
+                    }
+                }
+            }
+
             int positionInterval = g_positionInterval < 1 ? 1 : g_positionInterval;
             bool refreshPositions = !cacheUpdatedThisFrame &&
                                     (ImGui::GetFrameCount() % positionInterval == 0);
@@ -3901,15 +4614,64 @@ int main(int argc, char *argv[]) {
                     // Скелет читаем только когда он включён и цель не слишком
                     // далеко — на дистанции кости всё равно сливаются в пиксель,
                     // а чтения стоят трафика к процессу игры.
+                    // ── Якоря модели: голова и ноги ИЗ ОТРИСОВЫВАЕМОЙ модели ──
+                    // Пока espModelAnchor включён, бокс строится по фактическим
+                    // габаритам (KCC.head + Motor.LastInterpolatedPosition), а не
+                    // по серверному тику с ручным вертикальным оффсетом. Если
+                    // цепочка не прочиталась — молча откатываемся на старый путь.
+                    OxModelAnchors anch;
+                    if (espModelAnchor && player.distance < 400.f)
+                        anch = ox_readModelAnchors(player.address);
+
+                    Vector3 skelFeet = anch.valid
+                                     ? anch.feet
+                                     : livePos + Vector3(0.f, ox_boxYOffset(), 0.f);
+
                     if (skeleton && player.distance < 220.f)
-                        ox_readSkeleton(player.address,
-                                        livePos + Vector3(0.f, espBoxYOffset, 0.f),
-                                        player);
+                        ox_readSkeleton(player.address, skelFeet, player);
                     else
                         player.hasSkeletonData = false;
-                    Vector3 anchorPos = livePos + Vector3(0.f, espBoxYOffset, 0.f);
-                    w2sBottom = w2s_angular(anchorPos - Vector3(0, ox::BOX_FOOT, 0), liveCam, &visB);
-                    w2sTop    = w2s_angular(anchorPos + Vector3(0, ox::BOX_HEAD, 0), liveCam, &visT);
+
+                    // Проекция: матричная если VP прочиталась, иначе угловая.
+                    // Обе ветки дают одинаковые screen-координаты, разница в
+                    // точности — матрица учитывает всё, что движок делает с
+                    // камерой (шейк, отдача, нестандартный ADS-projection).
+                    auto project = [&](const Vector3& wp, bool* vis) -> ImVec2 {
+                        if (g_camVPValid) {
+                            ImVec2 sp;
+                            if (ox_w2sMatrix(g_camVP, wp, (float)abs_ScreenX,
+                                             (float)abs_ScreenY, &sp)) {
+                                const float M = 64.f;
+                                *vis = (sp.x >= -M && sp.x <= abs_ScreenX + M &&
+                                        sp.y >= -M && sp.y <= abs_ScreenY + M);
+                                return sp;
+                            }
+                            *vis = false;
+                            return ImVec2(-1.f, -1.f);
+                        }
+                        return w2s_angular(wp, liveCam, vis);
+                    };
+
+                    if (anch.valid) {
+                        // Фактические габариты: низ = ноги, верх = голова плюс
+                        // небольшой запас на макушку (head — это точка глаз/шеи).
+                        player.usedModelAnchor = true;
+                        player.anchorFeet = anch.feet;
+                        player.anchorHead = anch.head;
+                        player.anchorCrouching = anch.crouching;
+                        // Скорость от моторa точнее численной производной по
+                        // позициям: она не шумит на низком тикрейте.
+                        if (anch.velocity.x != 0.f || anch.velocity.y != 0.f ||
+                            anch.velocity.z != 0.f)
+                            player.motorVelocity = anch.velocity;
+                        w2sBottom = project(anch.feet, &visB);
+                        w2sTop    = project(anch.head + Vector3(0.f, 0.18f, 0.f), &visT);
+                    } else {
+                        player.usedModelAnchor = false;
+                        Vector3 anchorPos = livePos + Vector3(0.f, ox_boxYOffset(), 0.f);
+                        w2sBottom = project(anchorPos - Vector3(0, ox::BOX_FOOT, 0), &visB);
+                        w2sTop    = project(anchorPos + Vector3(0, ox::BOX_HEAD, 0), &visT);
+                    }
                 } else {
                     w2sBottom = player.w2sBottom; w2sTop = player.w2sTop;
                     visB = player.isVisibleBottom; visT = player.isVisibleTop;
@@ -3923,9 +4685,18 @@ int main(int argc, char *argv[]) {
                 // видимым, если открыта хотя бы грудь ИЛИ голова.
                 if (espColorByVisibility || aimCheckWalls) {
                     if (liveCam.valid) {
-                        Vector3 losBase = livePos + Vector3(0.f, espBoxYOffset, 0.f);
-                        Vector3 chest = losBase + Vector3(0.f, 1.30f, 0.f);
-                        Vector3 head  = losBase + Vector3(0.f, ox::BOX_HEAD, 0.f);
+                        // Луч к настоящей груди/голове модели, когда якоря есть.
+                        Vector3 chest, head;
+                        if (player.usedModelAnchor) {
+                            head  = player.anchorHead;
+                            chest = Vector3(player.anchorFeet.x,
+                                            player.anchorFeet.y + (head.y - player.anchorFeet.y) * 0.72f,
+                                            player.anchorFeet.z);
+                        } else {
+                            Vector3 losBase = livePos + Vector3(0.f, ox_boxYOffset(), 0.f);
+                            chest = losBase + Vector3(0.f, 1.30f, 0.f);
+                            head  = losBase + Vector3(0.f, ox::BOX_HEAD, 0.f);
+                        }
                         bool vis = ox_isTargetVisible(liveCam.pos, chest) ||
                                    ox_isTargetVisible(liveCam.pos, head);
                         player.losBlocked = !vis;
@@ -4048,7 +4819,21 @@ int main(int argc, char *argv[]) {
 
                 // ── СКЕЛЕТ ──────────────────────────────────────────────
                 if (skeleton && player.hasSkeletonData && liveCam.valid) {
-                    auto W2S = [&](const Vector3 &w, bool *vis) {
+                    // Тот же проектор, что и у бокса: иначе скелет и рамка
+                    // разъезжаются, когда матрица есть, а скелет идёт углами.
+                    auto W2S = [&](const Vector3 &w, bool *vis) -> ImVec2 {
+                        if (g_camVPValid) {
+                            ImVec2 sp;
+                            if (ox_w2sMatrix(g_camVP, w, (float)abs_ScreenX,
+                                             (float)abs_ScreenY, &sp)) {
+                                const float M = 64.f;
+                                *vis = (sp.x >= -M && sp.x <= abs_ScreenX + M &&
+                                        sp.y >= -M && sp.y <= abs_ScreenY + M);
+                                return sp;
+                            }
+                            *vis = false;
+                            return ImVec2(-1.f, -1.f);
+                        }
                         return w2s_angular(w, liveCam, vis);
                     };
                     struct Bone { const Vector3 *a, *b; };
@@ -4106,9 +4891,28 @@ int main(int argc, char *argv[]) {
                     };
                     ImVec2 corners[8];
                     bool cornerVisible[8];
-                    const Vector3 boxAnchor = livePos + Vector3(0.f, espBoxYOffset, 0.f);
-                    for (int i = 0; i < 8; ++i)
-                        corners[i] = w2s_angular(boxAnchor + offsets[i], liveCam, &cornerVisible[i]);
+                    // База 3D-бокса — ноги модели, если якоря есть.
+                    const Vector3 boxAnchor = player.usedModelAnchor
+                        ? player.anchorFeet + Vector3(0.f, ox::BOX_FOOT, 0.f)
+                        : livePos + Vector3(0.f, ox_boxYOffset(), 0.f);
+                    for (int i = 0; i < 8; ++i) {
+                        Vector3 wp = boxAnchor + offsets[i];
+                        if (g_camVPValid) {
+                            ImVec2 sp;
+                            if (ox_w2sMatrix(g_camVP, wp, (float)abs_ScreenX,
+                                             (float)abs_ScreenY, &sp)) {
+                                const float M = 64.f;
+                                cornerVisible[i] = (sp.x >= -M && sp.x <= abs_ScreenX + M &&
+                                                    sp.y >= -M && sp.y <= abs_ScreenY + M);
+                                corners[i] = sp;
+                            } else {
+                                cornerVisible[i] = false;
+                                corners[i] = ImVec2(-1.f, -1.f);
+                            }
+                        } else {
+                            corners[i] = w2s_angular(wp, liveCam, &cornerVisible[i]);
+                        }
+                    }
 
                     const int edges[][2] = {
                         {0, 1}, {1, 2}, {2, 3}, {3, 0},
@@ -5760,6 +6564,10 @@ static void oxTabESP() {
     static const char* L_LINETH  = ox_persist(oxorany("Line thickness"));
     static const char* L_LINECOL = ox_persist(oxorany("Line color"));
     static const char* L_LINEORI = ox_persist(oxorany("Line origin"));
+    static const char* L_ANCHOR  = ox_persist(oxorany("Bind to model"));
+    static const char* L_ANCHORH = ox_persist(oxorany("Box from real bones, not the server tick."));
+    static const char* L_MATRIX  = ox_persist(oxorany("Camera matrix W2S"));
+    static const char* L_MATRIXH = ox_persist(oxorany("Uses the engine view/projection matrix."));
     static const char* L_HPNUM   = ox_persist(oxorany("HP as number"));
     static const char* L_HPNUMH  = ox_persist(oxorany("Always show the number, not only below 100."));
     static const char* L_ARMOR   = ox_persist(oxorany("Armor"));
@@ -5792,11 +6600,18 @@ static void oxTabESP() {
         LegendDot(IM_COL32(80, 150, 255, 255), L_BEHIND, true);
     }
 
+    // Источник геометрии и проекции. Оба по умолчанию включены; выключать
+    // имеет смысл только для сравнения со старым поведением.
+    Toggle(L_ANCHOR, &espModelAnchor, L_ANCHORH);
+    Toggle(L_MATRIX, &espMatrixW2S, L_MATRIXH);
+
     Section(L_BOX);
     Toggle(L_BOXT, &espbox);
     if (espbox) {
-        // Вертикальная привязка: pivot lastTickPosition может быть на ногах,
-        // в центре капсулы или на голове — подбирается вживую.
+        // Вертикальная привязка. При матричной проекции она НЕ применяется
+        // (там низ бокса = позиция ног, оффсет не нужен), при угловой —
+        // применяется как раньше. Слайдер оставляем видимым, чтобы можно было
+        // докрутить, если матрица не нашлась и включился старый путь.
         SliderF(L_BOXY, &espBoxYOffset, -2.50f, 1.00f, "%.2f");
         Hint(L_BOXYH);
         SliderF(L_STROKE, &espstroke, 0.0f, 5.0f, "%.2f");
