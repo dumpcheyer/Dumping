@@ -157,6 +157,7 @@ static constexpr uint64_t PM_TRANSFORM         = 0x68;  // Transform worldCamera
 // Работает для ВСЕХ игроков (local + remote). worldCameraRoot есть только у
 // локального — remote игроки его не имеют, отсюда баг "ESP крепится к камере".
 // Vector3 @ 0x1C8 (12 байт: float x,y,z).
+static constexpr uint64_t PM_KCC_REFERENCE     = 0xB0;  // KCC* kccReference
 static constexpr uint64_t PM_LAST_TICK_POS     = 0x1C8;
 static constexpr uint64_t PM_LAST_SAVED_POS    = 0x1D4;
 static constexpr uint64_t PM_CHARACTER_MODEL   = 0x150; // GameObject* characterModel
@@ -212,6 +213,25 @@ static constexpr uint64_t VITALS_PROTECTION    = 0x90; // ProtectionValues*
 //   WNn.team (pf*) @ 0x90 ; pf.mYs (string teamId) @ 0x10 ; pf.mYo (string) @ 0x18
 // pf — ШАРЕННЫЙ объект данных команды; у сокомандников совпадает pf.mYs (teamId).
 static constexpr uint64_t WNN_TEAM_DATA        = 0x90;
+// nWc (компонент команды на PM+0x120) -> Cc team @0x90 — тот же объект данных
+// команды. Держим как второй путь: если один указатель не заполнен, работает
+// другой. Cc: dCs(0x10) teamId, dCQ(0x18) teamName, dCI(0x20) List<TeamMember>.
+static constexpr uint64_t NWC_TEAM_DATA        = 0x90;
+// nWc.TeammateStates — Dictionary<string userID, TeammateStatus>. В этом билде
+// nWc.team(0x90) приходит НУЛЁМ даже когда игрок в команде (лог: lpf=0x0 при
+// живом lw), а вот словарь состояний заполнен. Ключи — userID сокомандников,
+// ровно то, что нужно для сверки с PM.userID цели.
+static constexpr uint64_t NWC_TEAMMATE_STATES  = 0x70;
+static constexpr uint64_t NWC_PLAYER           = 0x80; // обратная ссылка на PM
+static constexpr uint64_t NWC_ONLINE           = 0x98; // int online (размер команды)
+// Dictionary с КЛЮЧОМ-ссылкой (string): entry = {hash, next, key*, value}
+static constexpr uint64_t DICT_SENTRY_STRIDE   = 0x20;
+static constexpr uint64_t DICT_SENTRY_HASHCODE = 0x0;
+static constexpr uint64_t DICT_SENTRY_KEY      = 0x10;
+static constexpr uint64_t DICT_SENTRY_VALUE    = 0x18;
+static constexpr uint64_t CC_TEAM_ID           = 0x10;
+static constexpr uint64_t CC_TEAM_NAME         = 0x18;
+static constexpr uint64_t CC_TEAM_MEMBERS      = 0x20;
 // pf (класс команды, TypeDefIndex 548):
 //   +0x10 string mYs                    — teamId
 //   +0x18 string mYo                    — teamName
@@ -337,6 +357,23 @@ static constexpr uint64_t RAGDOLL_BONES       = 0x88; // List<Transform> m_Bones
 // KCC (HyperHug...Player.KCC) — альтернативный источник головы:
 static constexpr uint64_t KCC_PLAYER          = 0x78; // PlayerManager*
 static constexpr uint64_t KCC_HEAD            = 0x88; // Transform head
+static constexpr uint64_t KCC_MOTOR           = 0x68; // KinematicCharacterMotor* <Motor>k__BackingField
+// ── KinematicCharacterMotor: интерполированная позиция отрисовки ───────────
+// LastInterpolatedPosition — это позиция, которой игра РИСУЕТ модель в
+// текущем кадре. В отличие от PM.lastTickPosition (серверный тик 10-20 Гц)
+// она обновляется каждый кадр, поэтому бокс не отстаёт от бегущей цели.
+static constexpr uint64_t MOTOR_INTERP_POS    = 0x1EC; // Vector3 LastInterpolatedPosition
+static constexpr uint64_t MOTOR_TICK_POS      = 0x1E0; // Vector3 InitialTickPosition
+static constexpr uint64_t MOTOR_BASE_VELOCITY = 0x210; // Vector3 BaseVelocity
+static constexpr uint64_t MOTOR_TRANSFORM     = 0x118; // Transform Wzu
+// ЖИВАЯ высота капсулы. Игра уменьшает её при приседе с KCC.normalHeight до
+// KCC.m_CrouchHeight — это читаемый снаружи признак приседа, которого не было
+// в PlayerFlags. Прицел, построенный как доля от неё, приседает вместе с целью.
+static constexpr uint64_t MOTOR_CAPSULE_HEIGHT = 0x34; // float CapsuleHeight
+static constexpr uint64_t MOTOR_CAPSULE_YOFF   = 0x38; // float CapsuleYOffset
+static constexpr uint64_t MOTOR_CAPSULE_RADIUS = 0x30; // float CapsuleRadius
+static constexpr uint64_t KCC_NORMAL_HEIGHT    = 0xA0; // float normalHeight
+static constexpr uint64_t KCC_CROUCH_HEIGHT    = 0xA4; // float m_CrouchHeight
 static constexpr uint64_t KCC_LOOK_HEIGHT_OFF = 0x90; // float lookHeightOffset
 
 // --- ПРЯМАЯ мировая позиция (нативные оффсеты движка, НЕ из dump.cs) ---
