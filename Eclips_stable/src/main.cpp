@@ -214,30 +214,49 @@ const int CACHE_UPDATE_INTERVAL = 3;
 uint64_t g_localPlayer = 0;
 std::string g_localTeamName;
 
+// Читает /proc/<pid>/cmdline в буфер. Возвращает длину cmd[0] (первого
+// nul-разделённого токена — это имя процесса) или 0.
+// БЫЛО: char cmd[128] — cmdline у некоторых BST-wrappers/сервисов длиннее;
+// первый токен оказывался обрезан, strcmp мимо.
+static size_t readCmdlineName(int pid, char *out, size_t outSize) {
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+	FILE *fp = fopen(path, "r");
+	if (!fp) return 0;
+	char buf[512] = {0};
+	size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+	fclose(fp);
+	if (n == 0) { out[0] = 0; return 0; }
+	// первый \0-разделённый токен = имя процесса
+	size_t namelen = 0;
+	while (namelen < n && buf[namelen]) namelen++;
+	if (namelen >= outSize) namelen = outSize - 1;
+	memcpy(out, buf, namelen);
+	out[namelen] = 0;
+	return namelen;
+}
+
 int getProcessID(const char *packageName)
 {
 	DIR *dir = opendir("/proc");
 	if (!dir) return -1;
 	struct dirent *entry;
+	size_t pkgLen = strlen(packageName);
 	while ((entry = readdir(dir)) != NULL)
 	{
 		int id = atoi(entry->d_name);
-		if (id > 0)
+		if (id <= 0) continue;
+		char cmd[512];
+		size_t n = readCmdlineName(id, cmd, sizeof(cmd));
+		if (n == 0) continue;
+		// главный процесс: cmdline РОВНО == packageName
+		// сервисы:        cmdline == packageName + ":<название>" (например ":main", ":sandbox")
+		// оба считаются совпадением по пакету — для fallback без preferModule.
+		if (strcmp(cmd, packageName) == 0 ||
+		    (n > pkgLen && memcmp(cmd, packageName, pkgLen) == 0 && cmd[pkgLen] == ':'))
 		{
-			char filename[64];
-			snprintf(filename, sizeof(filename), "/proc/%d/cmdline", id);
-			FILE *fp = fopen(filename, "r");
-			if (fp)
-			{
-				char cmdline[256] = {0};
-				size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
-				fclose(fp);
-				if (n > 0 && strcmp(packageName, cmdline) == 0)
-				{
-					closedir(dir);
-					return id;
-				}
-			}
+			closedir(dir);
+			return id;
 		}
 	}
 	closedir(dir);
@@ -258,18 +277,20 @@ static bool pidHasModule(int pid, const char *module) {
 	return found;
 }
 
-// cmdline процесса начинается с packageName? (обрезает \0-разделённые аргументы).
+// cmdline процесса начинается с packageName?
+// БЫЛО: буфер 128 байт — BST/wrapper'ы иногда суют перед именем свой
+// путь, и первый \0-токен оказывался обрезан → strcmp мимо. Плюс
+// теперь принимаем ":sub"-процессы того же пакета: preferModule всё
+// равно выберет верный, а fallback хотя бы не отдаст -1.
 static bool pidCmdlineMatches(int pid, const char *packageName) {
-	char path[64]; sprintf(path, "/proc/%d/cmdline", pid);
-	FILE* f = fopen(path, "r");
-	if (!f) return false;
-	char cmd[128] = {0};
-	size_t n = fread(cmd, 1, sizeof(cmd) - 1, f);
-	fclose(f);
+	char cmd[512];
+	size_t n = readCmdlineName(pid, cmd, sizeof(cmd));
 	if (n == 0) return false;
-	cmd[n] = 0;
-	// главный процесс: cmdline РОВНО == packageName (сервисы имеют суффикс ":name")
-	return strcmp(cmd, packageName) == 0;
+	size_t pkgLen = strlen(packageName);
+	if (strcmp(cmd, packageName) == 0) return true;
+	if (n > pkgLen && memcmp(cmd, packageName, pkgLen) == 0 && cmd[pkgLen] == ':')
+		return true;
+	return false;
 }
 
 // Находит ГЛАВНЫЙ процесс игры: среди всех с совпадающим cmdline выбирает тот,
