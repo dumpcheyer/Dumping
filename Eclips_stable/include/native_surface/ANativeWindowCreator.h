@@ -10,12 +10,20 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
     ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
+    if (nullptr == ClassName##__##MethodName && missing.empty())                                                                         \
+    {                                                                                                                                    \
+        missing = #ClassName "::" #MethodName;                                                                                           \
+    }
+#define ResolveMethodCritical(ClassName, MethodName, Handle, MethodSignature)                                                            \
+    ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
     if (nullptr == ClassName##__##MethodName)                                                                                            \
     {                                                                                                                                    \
-         \
+        if (missing.empty()) missing = #ClassName "::" #MethodName;                                                                      \
+        critical_missing = true;                                                                                                         \
     }
 
 namespace android
@@ -139,6 +147,8 @@ namespace android
             int32_t (*SurfaceComposerClient__GetDisplayState)(StrongPointer<void> &display, ui::DisplayState *displayState) = nullptr;
             int32_t (*SurfaceComposerClient__GetDisplayInfo)(StrongPointer<void> &display, ui::DisplayInfo *displayInfo) = nullptr;
             std::vector<ui::PhysicalDisplayId> (*SurfaceComposerClient__GetPhysicalDisplayIds)() = nullptr;
+            bool ready = false;   // все критичные символы разрешились
+            std::string missing;  // первый не найденный символ (для лога)
             StrongPointer<void> (*SurfaceComposerClient__GetPhysicalDisplayToken)(ui::PhysicalDisplayId displayId) = nullptr;
 
             void (*SurfaceComposerClient__Transaction__Constructor)(void *thiz) = nullptr;
@@ -162,6 +172,7 @@ namespace android
                 {
                     return;
                 }
+                bool critical_missing = false;
 
                 static std::unordered_map<size_t, std::unordered_map<void **, const char *>> patchesTable = {
                     {
@@ -209,18 +220,18 @@ namespace android
                 auto libutils = symbolMethod.Open("/system/lib/libutils.so", RTLD_LAZY);
 #endif
 
-                ResolveMethod(RefBase, IncStrong, libutils, "_ZNK7android7RefBase9incStrongEPKv");
-                ResolveMethod(RefBase, DecStrong, libutils, "_ZNK7android7RefBase9decStrongEPKv");
+                ResolveMethodCritical(RefBase, IncStrong, libutils, "_ZNK7android7RefBase9incStrongEPKv");
+                ResolveMethodCritical(RefBase, DecStrong, libutils, "_ZNK7android7RefBase9decStrongEPKv");
 
-                ResolveMethod(String8, Constructor, libutils, "_ZN7android7String8C2EPKc");
-                ResolveMethod(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
+                ResolveMethodCritical(String8, Constructor, libutils, "_ZN7android7String8C2EPKc");
+                ResolveMethodCritical(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
 
                 ResolveMethod(LayerMetadata, Constructor, libgui, "_ZN7android13LayerMetadataC2Ev");
                 ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
 
 
-                ResolveMethod(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
-                ResolveMethod(SurfaceComposerClient, CreateSurface, libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
+                ResolveMethodCritical(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
+                ResolveMethodCritical(SurfaceComposerClient, CreateSurface, libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
                 ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
                 ResolveMethod(SurfaceComposerClient, GetDisplayState, libgui, "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
                 ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui, "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
@@ -233,7 +244,7 @@ namespace android
                 ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
 
                 ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
-                ResolveMethod(SurfaceControl, GetSurface, libgui, "_ZN7android14SurfaceControl10getSurfaceEv");
+                ResolveMethodCritical(SurfaceControl, GetSurface, libgui, "_ZN7android14SurfaceControl10getSurfaceEv");
                 ResolveMethod(SurfaceControl, DisConnect, libgui, "_ZN7android14SurfaceControl10disconnectEv");
                 
                 auto it = patchesTable.find(systemVersion);
@@ -246,6 +257,10 @@ namespace android
                     }
                 }
 
+                ready = !critical_missing;
+                if (!ready) {
+                    fprintf(stderr, "[overlay] init FAILED: unresolved '%s' on Android %d — overlay symbols not available on this ROM\n", missing.c_str(), systemVersion);
+                }
                 symbolMethod.Close(libutils);
                 symbolMethod.Close(libgui);
             }
@@ -482,6 +497,10 @@ namespace android
 
         static DisplayInfo GetDisplayInfo()
         {
+            if (!detail::Functionals::GetInstance().ready) {
+                DisplayInfo empty{};
+                return empty;
+            }
             auto &surfaceComposerClient = GetComposerInstance();
             detail::ui::DisplayState displayInfo{};
 
@@ -505,6 +524,10 @@ namespace android
 
         static ANativeWindow *Create(const char *name, int32_t width = -1, int32_t height = -1, bool skipScrenshot_ = false)
         {
+            if (!detail::Functionals::GetInstance().ready) {
+                fprintf(stderr, "[overlay] Create() aborted: system symbols unresolved (see startup log). SDK support: Android 9-14 with system libraries; unusual ROMs / heavily-modified builds may not work.\n");
+                return nullptr;
+            }
             auto &surfaceComposerClient = GetComposerInstance();
 
             while (-1 == width || -1 == height)
