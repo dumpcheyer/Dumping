@@ -1,0 +1,180 @@
+.\" oxdump.1 - manual page for the oxdump IL2CPP dumper.
+.\" Render/preview with:  man -l docs/oxdump.1
+.\" Lint with:            groff -man -Tutf8 -ww docs/oxdump.1 >/dev/null
+.TH OXDUMP 1 "2026-07-26" "oxdump 1.0.0" "User Commands"
+.SH NAME
+oxdump \- extract IL2CPP metadata from Unity games into a dump archive
+.SH SYNOPSIS
+.B oxdump
+.I metadata binary
+.RB [ \-o
+.IR file ]
+.RB [ \-v ]
+.RB [ \-q ]
+.RB [ \-\-skip\-pair\-check ]
+.RB [ \-\-xref\-names ]
+.br
+.B oxdump
+.BR \-h | \-\-help
+.br
+.B oxdump
+.B \-\-version
+.SH DESCRIPTION
+.B oxdump
+is a fast, dependency-free C++17 reimplementation of a Unity IL2CPP dumper.
+Given a game's
+.I global-metadata.dat
+and its compiled IL2CPP image
+.RI ( libil2cpp.so ,
+.IR UnityFramework ,
+or
+.IR GameAssembly.dll ),
+it reconstructs the type system \(em classes, fields, methods, and their runtime
+addresses \(em and writes a set of human- and tool-readable files into a single
+ZIP archive.
+.PP
+The two input files may be given in either order; each is identified by its
+signature
+.RB ( AF\ 1B\ B1\ FA
+for metadata, and ELF / Mach-O / PE magic for the binary), so argument
+position does not matter.
+.PP
+Three binary formats are supported and share one pipeline:
+ELF64 (Android / Linux), Mach-O 64-bit (iOS / macOS, including FAT archives),
+and PE64 (Windows). The encryption key applied to the metadata header is
+recovered automatically from header invariants; several transforms
+(XOR, ADD32, SUB32, XOR+ROL, XOR+index) are tried in turn. When the header
+itself is unreadable, a
+.I headerless
+mode rebuilds the section map by scanning the file body.
+.PP
+.B oxdump
+never emits a silently corrupt dump: known-bad situations (mismatched file
+pair, packed library, unsupported chained fixups) are detected and explained
+rather than ignored.
+.SH OPTIONS
+.TP
+.BI \-o " file"
+Write the dump archive to
+.I file
+instead of the default
+.IR oxide_dump.zip .
+.TP
+.BR \-v ", " \-\-verbose
+Verbose log: show how the key, metadata tables, and MetadataRegistration were
+located, plus per-stage details.
+.TP
+.BR \-q ", " \-\-quiet
+Quiet mode: print only the path to the produced archive on standard output.
+Useful in scripts. Suppresses the progress log on standard error.
+.TP
+.B \-\-skip\-pair\-check
+Do not abort when the metadata and binary appear to come from different
+builds. The resulting types may be wrong; use only when you know the pairing
+is correct.
+.TP
+.B \-\-xref\-names
+Collect naming hints for obfuscated methods by disassembling method prologues
+and following references to string literals. Adds a few seconds to the run.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-version
+Print the version string and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Success; the dump archive was written.
+.TP
+.B 1
+Failure while parsing the metadata or the binary (unreadable header that
+headerless mode could not recover, missing MetadataRegistration, packed
+library), or an internal error.
+.TP
+.B 2
+Usage error: missing or unrecognized arguments, or an unknown flag.
+.TP
+.B 3
+The metadata and binary are from different builds and
+.B \-\-skip\-pair\-check
+was not given.
+.SH EXAMPLES
+.PP
+Dump an Android game to the default archive:
+.PP
+.RS
+.EX
+oxdump global-metadata.dat libil2cpp.so
+.EE
+.RE
+.PP
+Choose the output name and show a verbose log:
+.PP
+.RS
+.EX
+oxdump global-metadata.dat libil2cpp.so -o dump.zip -v
+.EE
+.RE
+.PP
+Windows game (arguments in any order), quiet output for a script:
+.PP
+.RS
+.EX
+archive=$(oxdump GameAssembly.dll global-metadata.dat -q)
+.EE
+.RE
+.PP
+Force a dump despite a mismatched pair, with string-based name hints:
+.PP
+.RS
+.EX
+oxdump meta.dat UnityFramework --skip-pair-check --xref-names
+.EE
+.RE
+.SH FILES
+The output archive contains:
+.TP
+.B dump.cs
+Readable class tree with fields and methods.
+.TP
+.B il2cpp.h
+C structures with offsets (Il2CppDumper-compatible).
+.TP
+.B script.json
+Method addresses for IDA / Ghidra / Binary Ninja.
+.TP
+.B offsets.h
+Namespace-per-class header with
+.B constexpr
+field offsets for C++ tooling.
+.TP
+.B offsets.cs
+Parallel C# static classes for C# tooling.
+.TP
+.B types.txt
+Flat, grep-friendly index of all classes.
+.TP
+.B REPORT.txt
+What was detected and how, including headerless notes.
+.SH BUGS
+Chained fixups (iOS 15+ / arm64e Mach-O) are not supported; such builds are
+rejected with a clear message rather than mis-parsed. End-to-end PE support has
+been validated only against a synthetic image, not a real
+.IR GameAssembly.dll .
+In headerless mode, method parameters and the assembly (Image[]) list are not
+recovered. Report issues with the output of a
+.B \-\-verbose
+run attached.
+.SH SEE ALSO
+.BR file (1),
+.BR nm (1),
+.BR objdump (1),
+.BR readelf (1)
+.PP
+Project documentation: see
+.I README.md
+in the source distribution.
+.SH AUTHORS
+The oxdump contributors. Released under the MIT License; a tool for research
+and education.

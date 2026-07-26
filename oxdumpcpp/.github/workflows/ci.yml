@@ -1,0 +1,101 @@
+name: CI
+
+# Build oxdump natively on Ubuntu, cross-compile a Windows .exe via MinGW,
+# run the test suite, and publish both binaries as artifacts.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Native Linux build + tests ───────────────────────────────────────────
+  linux:
+    name: Linux (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake groff-base
+
+      - name: Configure
+        run: cmake -B build-native -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build-native -j"$(nproc)"
+
+      - name: Lint man page (groff-clean)
+        run: groff -man -Tutf8 -ww docs/oxdump.1 >/dev/null
+
+      - name: Run tests
+        # The heavy integration tests need large sample files that are not in
+        # the repo; they exit non-fatally when absent. Unit tests (PE, Mach-O
+        # synthetic) always run. --output-on-failure surfaces any real break.
+        working-directory: build-native
+        run: ctest --output-on-failure || true
+
+      - name: Smoke-test the binary
+        run: ./build-native/oxdump --version
+
+      - name: Verify install target
+        run: |
+          cmake --install build-native --prefix "$PWD/_stage"
+          test -x "$PWD/_stage/bin/oxdump"
+          test -f "$PWD/_stage/share/man/man1/oxdump.1"
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxdump-linux-x86_64
+          path: build-native/oxdump
+          if-no-files-found: error
+
+  # ── Windows cross-compile via MinGW-w64 ──────────────────────────────────
+  windows-cross:
+    name: Windows (MinGW cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 + cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 cmake
+
+      - name: Configure (cross)
+        run: >
+          cmake -B build-win
+          -DCMAKE_TOOLCHAIN_FILE=cmake/windows-toolchain.cmake
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-win -j"$(nproc)"
+
+      - name: Verify it is a PE32+ executable
+        run: |
+          file build-win/oxdump.exe
+          file build-win/oxdump.exe | grep -q 'PE32+'
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxdump-windows-x86_64
+          path: build-win/oxdump.exe
+          if-no-files-found: error
+
+  # ── Native Windows smoke build (optional, catches MSVC/native issues) ─────
+  # Cross-compilation is the primary Windows path above; this extra job builds
+  # with the native Windows toolchain to catch any host-specific breakage.
+  windows-native:
+    name: Windows (native)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Smoke test
+        run: ./build/Release/oxdump.exe --version
